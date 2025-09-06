@@ -91,6 +91,74 @@ class Reels extends CI_Controller
         return $o;
     }
 
+/***************************** Helper: Normalize Schedule String *****************************/
+private function normalizeLocalSchedule(?string $s): ?string
+{
+    if (!$s) return null;
+    $s = trim($s);
+    if ($s === '') return null;
+    $s = str_replace('/', '-', $s);
+    $s = preg_replace('/\s+/', ' ', $s);
+    // YYYY-MM-DD HH:MM:SS -> YYYY-MM-DD HH:MM
+    if (preg_match('/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$/', $s)) {
+        $s = substr($s, 0, 16);
+    }
+    // مسافة إلى T للتوافق مع localToUtc
+    if (preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/', $s)) {
+        $s = str_replace(' ', 'T', $s);
+    }
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/', $s)) {
+        $ts = strtotime($s);
+        if ($ts === false) return null;
+        $s = date('Y-m-d\TH:i', $ts);
+    }
+    return $s;
+}
+
+    /* ====== Lock helpers ====== */
+
+    private function resolveLockPath(string $name): string
+    {
+        // الأفضل: داخل المشروع لضمان صلاحيات الكتابة عبر CLI
+        $dir = FCPATH.'application/cache/locks/';
+        if (!is_dir($dir)) @mkdir($dir, 0775, true);
+        if (is_dir($dir) && is_writable($dir)) {
+            return $dir.$name;
+        }
+        // بديل: مجلد النظام المؤقت
+        $tmp = @sys_get_temp_dir();
+        if ($tmp && is_dir($tmp) && is_writable($tmp)) {
+            return rtrim($tmp,'/').'/'.$name;
+        }
+        // آخر حل: جذر المشروع
+        return FCPATH.$name;
+    }
+
+    private function withLock(string $lockName, callable $fn): void
+    {
+        $lock = $this->resolveLockPath($lockName);
+        $this->dbg('cron_lock_path', $lock);
+
+        $fh = @fopen($lock, 'c+');
+        if (!$fh) {
+            // لا نفشل التنفيذ – نكمل بدون قفل، مع تسجيل
+            $this->dbg('cron_lock_open_fail', $lock);
+            $fn();
+            return;
+        }
+        if (!flock($fh, LOCK_EX|LOCK_NB)) {
+            echo "Another instance running (lock=$lock)\n";
+            fclose($fh);
+            return;
+        }
+        try {
+            $fn();
+        } finally {
+            flock($fh, LOCK_UN);
+            fclose($fh);
+        }
+    }
+
     /* ======================== Upload Form ======================== */
 
     public function upload()
@@ -98,6 +166,7 @@ class Reels extends CI_Controller
         $this->require_login();
         $uid=(int)$this->session->userdata('user_id');
 
+        // نستخدم pagesModel للعرض فقط (صور/أسماء)
         $pages=$this->pagesModel->get_pages_by_user($uid);
         if(!$pages){
             $this->session->set_flashdata('msg','لا يوجد صفحات، قم بالربط أولاً.');
@@ -133,262 +202,593 @@ class Reels extends CI_Controller
         $this->load->view('reels_upload',$data);
     }
 
-    /* ======================== Processing Upload ======================== */
+   /* ======================== Processing Upload ======================== */
+public function process_upload()
+{
+    $this->require_login();
+    $uid = (int)$this->session->userdata('user_id');
 
-    public function process_upload()
-    {
-        $this->require_login();
-        $uid=(int)$this->session->userdata('user_id');
+    // Helper داخلي سريع للّوج في stories_api.log
+    $stories_log = function(string $label, array $ctx = []) {
+        $dir = FCPATH.'application/logs/';
+        if (!is_dir($dir)) @mkdir($dir, 0775, true);
+        $line = '['.gmdate('Y-m-d H:i:s')."] $label";
+        if (!empty($ctx)) $line .= ' '.json_encode($ctx, JSON_UNESCAPED_UNICODE);
+        @file_put_contents($dir.'stories_api.log', $line.PHP_EOL, FILE_APPEND);
+    };
 
-        $pages=$this->pagesModel->get_pages_by_user($uid);
-        if(!$pages){
-            $this->session->set_flashdata('msg','لا يوجد صفحات.');
-            redirect('reels/upload'); return;
-        }
+    // لوج لقيم ini الحالية (قيم الويب الفعلية)
+    $stories_log('CTRL_ENTER', [
+        'ini' => [
+            'upload_max_filesize' => ini_get('upload_max_filesize'),
+            'post_max_size'       => ini_get('post_max_size'),
+            'memory_limit'        => ini_get('memory_limit'),
+            'max_execution_time'  => ini_get('max_execution_time'),
+        ],
+        'post_media_type' => $this->input->post('media_type', true),
+    ]);
 
-        $media_type = $this->input->post('media_type') ?: 'reel';
-        $fb_page_ids=$this->input->post('fb_page_ids');
-        if(empty($fb_page_ids)){
-            $this->session->set_flashdata('msg','اختر صفحة واحدة على الأقل.');
-            redirect('reels/upload'); return;
-        }
+    // للعرض
+    $pages = $this->pagesModel->get_pages_by_user($uid);
+    if (!$pages) {
+        $stories_log('CTRL_NO_PAGES', []);
+        $this->session->set_flashdata('msg','لا يوجد صفحات.');
+        redirect('reels/upload'); return;
+    }
+    // للمصادقة/التوكن: نقرأ من جدول المنصة
+    $pagesTokens = $this->Reel_model->get_user_pages($uid);
 
-        /* Story Photo */
-        if($media_type==='story_photo' && self::FEATURE_STORIES){
-            if(empty($_FILES['story_photo_file']['name'])){
-                $this->session->set_flashdata('msg','اختر صورة للستوري.');
-                redirect('reels/upload'); return;
+    $media_type  = $this->input->post('media_type') ?: 'reel';
+    $fb_page_ids = $this->input->post('fb_page_ids');
+
+    if (empty($fb_page_ids)) {
+        $stories_log('CTRL_NO_SELECTED_PAGES', []);
+        $this->session->set_flashdata('msg','اختر صفحة واحدة على الأقل.');
+        redirect('reels/upload'); return;
+    }
+
+    // هيلبر للحصول على توكن الصفحة بغض النظر عن شكل $pagesTokens
+    $findPageToken = function($pagesTokens, string $pid) {
+        if (is_array($pagesTokens)) {
+            if (isset($pagesTokens[$pid]) && is_array($pagesTokens[$pid])) {
+                $row = $pagesTokens[$pid];
+                return $row['page_access_token'] ?? $row['access_token'] ?? null;
             }
-            $responses = $this->Reel_model->upload_story_photo($uid,$pages,$_POST,$_FILES);
-            $success=[];$error=[];
-            foreach($responses as $r){ if($r['type']==='success') $success[]=$r['msg']; else $error[]=$r['msg']; }
-            if($success) $this->session->set_flashdata('msg_success',implode('<br>',$success));
-            if($error)   $this->session->set_flashdata('msg',implode('<br>',$error));
-            if($this->input->is_ajax_request()){
-                $this->send_json([
-                    'success'=>true,
-                    'messages'=>array_merge(
-                        array_map(fn($s)=>['type'=>'success','msg'=>$s],$success),
-                        array_map(fn($e)=>['type'=>'error','msg'=>$e],$error)
-                    )
+            foreach ($pagesTokens as $row) {
+                if (!is_array($row)) continue;
+                $rid = $row['fb_page_id'] ?? $row['page_id'] ?? null;
+                if ((string)$rid === (string)$pid) {
+                    return $row['page_access_token'] ?? $row['access_token'] ?? null;
+                }
+            }
+        }
+        return null;
+    };
+
+    // فلترة الصفحات حسب وجود التوكن
+    $valid_pages = [];
+    $missing_token = [];
+    foreach ((array)$fb_page_ids as $pid) {
+        $tok = $findPageToken($pagesTokens, (string)$pid);
+        if (!empty($tok)) $valid_pages[] = (string)$pid;
+        else $missing_token[] = (string)$pid;
+    }
+
+    $stories_log('CTRL_PAGES_FILTER', [
+        'selected'       => array_values((array)$fb_page_ids),
+        'valid_pages'    => $valid_pages,
+        'missing_token'  => $missing_token
+    ]);
+
+    if ($missing_token) {
+        $this->session->set_flashdata('msg', 'تم استبعاد صفحات بدون توكن: '.implode(', ', $missing_token));
+    }
+    if (!$valid_pages) {
+        $stories_log('CTRL_NO_VALID_PAGES', ['selected_count'=>count((array)$fb_page_ids)]);
+        $this->session->set_flashdata('msg', 'لا توجد صفحات صالحة للنشر (توكن مفقود).');
+        redirect('reels/upload'); return;
+    }
+
+    $stories_log('CTRL_BEFORE_BRANCH', [
+        'media_type'=>$media_type,
+        'FEATURE_STORIES'=>self::FEATURE_STORIES,
+        'selected_pages_count'=>count((array)$fb_page_ids),
+        'valid_pages_count'=>count($valid_pages)
+    ]);
+
+    /* Story Photo: دعم الفوري + المجدول */
+   if ($media_type === 'story_photo' && self::FEATURE_STORIES) {
+    try {
+        $sf = $_FILES['story_photo_file'] ?? null;
+        $isArray = $sf && is_array($sf['name']);
+        $stories_log('CTRL_STORY_PHOTO_ENTRY', [
+            'file_present' => $sf ? (!empty($sf['name']) || !empty($sf['name'][0])) : false,
+            'is_array'     => $isArray,
+            'file_err'     => $sf['error'] ?? null,
+            'file_size'    => $sf['size'] ?? null,
+            'file_type'    => $sf['type'] ?? null,
+            'pages'        => $valid_pages
+        ]);
+
+        if (!$sf) {
+            $this->session->set_flashdata('msg','اختر صورة للستوري.');
+            redirect('reels/upload'); return;
+        }
+
+        // مصفوفات موحّدة للملفات
+        $names = $isArray ? (array)$sf['name']     : [$sf['name']];
+        $types = $isArray ? (array)$sf['type']     : [$sf['type']];
+        $tmps  = $isArray ? (array)$sf['tmp_name'] : [$sf['tmp_name']];
+        $errs  = $isArray ? (array)$sf['error']    : [$sf['error']];
+        $sizes = $isArray ? (array)$sf['size']     : [$sf['size']];
+        $count = count($names);
+
+        // إعدادات المنطقة الزمنية
+        $tz_offset = (int)($this->input->post('tz_offset_minutes') ?? 0);
+        $tz_name   = trim((string)$this->input->post('tz_name'));
+
+        // جهّز مصادر محتملة للجدولة (مصفوفية ومفردة)
+        $candidateArrays = [];
+        $preferKeys = [
+            'story_schedule_locals','story_schedule_times',
+            'photo_schedule_locals','photo_schedule_times',
+            'story_photo_schedule_locals','story_photo_schedule_times',
+            'schedule_times','scheduled_times'
+        ];
+        foreach ($preferKeys as $k) {
+            $v = $_POST[$k] ?? null;
+            if (is_array($v)) $candidateArrays[$k] = $v;
+        }
+        // مسح ديناميكي لأي مصفوفة قد تحمل أوقات للستوري/الصورة
+        foreach ($_POST as $k=>$v) {
+            if (!is_array($v)) continue;
+            $kn = strtolower((string)$k);
+            if (preg_match('/(sched|time|date)/', $kn) && preg_match('/(story|photo)/', $kn)) {
+                if (!isset($candidateArrays[$k])) $candidateArrays[$k] = $v;
+            }
+        }
+
+        // حقول مفردة fallback لأول عنصر فقط
+        $singleCandidates = [
+            'story_schedule_local','story_schedule_time','story_scheduled_time',
+            'schedule_time','scheduled_time','scheduled_local','schedule_local'
+        ];
+        $singleValues = [];
+        foreach ($singleCandidates as $k) {
+            $val = trim((string)($this->input->post($k) ?? ''));
+            if ($val !== '') { $singleValues[$k] = $val; }
+        }
+
+        $stories_log('CTRL_STORY_PHOTO_SCHED_KEYS', [
+            'post_keys'      => array_keys($_POST),
+            'candidate_keys' => array_keys($candidateArrays),
+            'single_keys'    => array_keys($singleValues)
+        ]);
+
+        $allowedImg = ['jpg','jpeg','png','webp','gif'];
+        $successMsgs = [];
+        $errorMsgs   = [];
+
+        for ($i=0; $i<$count; $i++) {
+            // عنصر واحد
+            $fileOne = [
+                'name'     => $names[$i] ?? '',
+                'type'     => $types[$i] ?? '',
+                'tmp_name' => $tmps[$i]  ?? '',
+                'error'    => (int)($errs[$i] ?? UPLOAD_ERR_NO_FILE),
+                'size'     => (int)($sizes[$i] ?? 0),
+            ];
+
+            if ($fileOne['error'] === UPLOAD_ERR_INI_SIZE || $fileOne['error'] === UPLOAD_ERR_FORM_SIZE) {
+                $stories_log('CTRL_STORY_PHOTO_SIZE_LIMIT', ['idx'=>$i,'err'=>$fileOne['error']]);
+                $errorMsgs[] = 'حجم الصورة يتجاوز الحد الأقصى (عنصر #'.($i+1).').';
+                continue;
+            }
+            if ($fileOne['error'] !== UPLOAD_ERR_OK || !is_file($fileOne['tmp_name'])) {
+                $stories_log('CTRL_STORY_PHOTO_UPLOAD_ERR', ['idx'=>$i,'err'=>$fileOne['error']]);
+                $errorMsgs[] = 'فشل رفع ملف ستوري الصورة (عنصر #'.($i+1).').';
+                continue;
+            }
+
+            $ext = strtolower(pathinfo($fileOne['name'], PATHINFO_EXTENSION));
+            if (!in_array($ext, $allowedImg, true)) {
+                $errorMsgs[] = 'امتداد غير مدعوم لستوري الصورة (عنصر #'.($i+1).').';
+                continue;
+            }
+
+            // الوصف + الهاشتاجات
+            $desc = trim(xss_clean((string)$this->input->post('description')));
+            if ($desc==='') {
+                $base = pathinfo($fileOne['name'], PATHINFO_FILENAME);
+                $desc = $base;
+            }
+            $selected_tags = trim((string)$this->input->post('selected_hashtags'));
+            if ($selected_tags!=='') {
+                foreach (preg_split('/\s+/u',$selected_tags) as $tg){
+                    if ($tg==='') continue;
+                    if (stripos($desc,$tg)===false) $desc.=' '.$tg;
+                }
+            }
+
+            // استخرج وقت العنصر i من أي مصدر مرشّح
+            $rawLocal = '';
+            foreach ($candidateArrays as $k=>$arr) {
+                if (isset($arr[$i]) && trim((string)$arr[$i])!=='') {
+                    $rawLocal = trim((string)$arr[$i]); break;
+                }
+            }
+            // fallback مفرد لأول عنصر فقط
+            if ($rawLocal === '' && $i === 0) {
+                foreach ($singleValues as $v) {
+                    if (trim($v)!==''){ $rawLocal = trim($v); break; }
+                }
+            }
+
+            $normLocal = $this->normalizeLocalSchedule($rawLocal);
+            $parsedUtc = $normLocal ? $this->localToUtc($normLocal, $tz_offset) : null;
+            $isFuture  = $this->isFutureUtc($parsedUtc);
+
+            $stories_log('CTRL_STORY_PHOTO_ITEM', [
+                'idx'=>$i,
+                'name'=>$fileOne['name'],
+                'raw'=>$rawLocal,
+                'normalized'=>$normLocal,
+                'parsed_utc'=>$parsedUtc,
+                'is_future'=>$isFuture
+            ]);
+
+            if ($parsedUtc && $isFuture) {
+                // جدولة هذا العنصر
+                $absDir = FCPATH.self::SCHEDULE_DIR;
+                if (!is_dir($absDir)) @mkdir($absDir,0775,true);
+
+                $safe  = preg_replace('/[^a-zA-Z0-9_\-\.]/','_', $fileOne['name']);
+                $fname = 'story_photo_sched_'.time().'_'.$i.'_'.mt_rand(1000,9999).'_'.$safe;
+
+                if (!move_uploaded_file($fileOne['tmp_name'], $absDir.$fname)) {
+                    $errorMsgs[] = 'فشل حفظ الصورة للجدولة (عنصر #'.($i+1).').';
+                    continue;
+                }
+
+                $original_local_time = null;
+                if ($normLocal && preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/', $normLocal)) {
+                    $original_local_time = str_replace('T',' ', $normLocal).':00';
+                }
+
+                $now = gmdate('Y-m-d H:i:s');
+                $rows = [];
+                foreach ($valid_pages as $pid) {
+                    $rows[] = [
+                        'user_id'                 => $uid,
+                        'fb_page_id'              => $pid,
+                        'video_path'              => self::SCHEDULE_DIR.$fname,
+                        'description'             => $desc,
+                        'scheduled_time'          => $parsedUtc,
+                        'original_local_time'     => $original_local_time,
+                        'original_offset_minutes' => $tz_offset,
+                        'original_timezone'       => $tz_name,
+                        'media_type'              => 'story_photo',
+                        'status'                  => 'pending',
+                        'attempt_count'           => 0,
+                        'processing'              => 0,
+                        'created_at'              => $now
+                    ];
+                }
+                $this->db->insert_batch('scheduled_reels', $rows);
+                $stories_log('PHOTO_SCHED_CREATE', [
+                    'idx'=>$i,
+                    'pages'=>count($valid_pages),
+                    'utc'=>$parsedUtc,
+                    'file'=>self::SCHEDULE_DIR.$fname
                 ]);
-                return;
-            }
-            redirect('reels/list'); return;
-        }
+                $successMsgs[] = 'تمت جدولة ستوري الصورة (عنصر #'.($i+1).') لعدد '.count($valid_pages).' صفحة.';
+            } else {
+                // نشر فوري لهذا العنصر
+                $_POST['fb_page_ids'] = $valid_pages;
+                $filesNormalized = ['story_photo_file' => $fileOne];
+                $responses = $this->Reel_model->upload_story_photo($uid, $pagesTokens, $_POST, $filesNormalized);
 
-        /* Story Video */
-        if($media_type==='story_video' && self::FEATURE_STORIES){
-            if(empty($_FILES['video_files']['name'][0])){
+                foreach ($responses as $r) {
+                    if (($r['type'] ?? '') === 'success') $successMsgs[] = $r['msg'] ?? '';
+                    else $errorMsgs[] = $r['msg'] ?? '';
+                }
+            }
+        } // end for
+
+        if ($successMsgs) $this->session->set_flashdata('msg_success', implode('<br>', array_filter($successMsgs)));
+        if ($errorMsgs)   $this->session->set_flashdata('msg', implode('<br>', array_filter($errorMsgs)));
+
+        if ($this->input->is_ajax_request()) {
+            $this->send_json([
+                'success'=> empty($errorMsgs),
+                'messages'=> array_merge(
+                    array_map(fn($s)=>['type'=>'success','msg'=>$s], array_filter($successMsgs)),
+                    array_map(fn($e)=>['type'=>'error','msg'=>$e], array_filter($errorMsgs))
+                )
+            ], empty($errorMsgs) ? 200 : 400);
+            return;
+        }
+        redirect('reels/list'); return;
+
+    } catch (Throwable $e) {
+        log_message('error','story_photo_fatal: '.$e->getMessage().' @'.$e->getFile().':'.$e->getLine());
+        $stories_log('CTRL_STORY_PHOTO_FATAL', ['msg'=>$e->getMessage(),'file'=>$e->getFile(),'line'=>$e->getLine()]);
+        if ($this->input->is_ajax_request()) {
+            $this->send_json(['success'=>false,'error'=>'internal_error','message'=>$e->getMessage()], 500);
+            return;
+        }
+        $this->session->set_flashdata('msg','حصل خطأ داخلي أثناء نشر/جدولة ستوري الصورة.');
+        redirect('reels/upload'); return;
+    }
+}
+    /* Story Video */
+    if ($media_type === 'story_video' && self::FEATURE_STORIES) {
+        try {
+            $stories_log('CTRL_STORY_VIDEO_ENTRY', [
+                'first_name' => $_FILES['video_files']['name'][0] ?? '',
+                'first_size' => (int)($_FILES['video_files']['size'][0] ?? 0),
+                'first_err'  => (int)($_FILES['video_files']['error'][0] ?? -1),
+                'pages'      => $valid_pages
+            ]);
+
+            if (empty($_FILES['video_files']['name'][0])) {
                 $this->session->set_flashdata('msg','اختر ملفات فيديو (ستوري).');
                 redirect('reels/upload'); return;
             }
-            $responses = $this->Reel_model->upload_story_video($uid,$pages,$_POST,$_FILES);
-            $success=[];$error=[];
-            foreach($responses as $r){ if($r['type']==='success') $success[]=$r['msg']; else $error[]=$r['msg']; }
-            if($success) $this->session->set_flashdata('msg_success',implode('<br>',$success));
-            if($error)   $this->session->set_flashdata('msg',implode('<br>',$error));
-            if($this->input->is_ajax_request()){
+
+            $_POST['fb_page_ids'] = $valid_pages;
+
+            // مرر صفحات التوكن من جدول المنصة
+            $responses = $this->Reel_model->upload_story_video($uid, $pagesTokens, $_POST, $_FILES);
+            $success=[]; $error=[];
+            foreach ($responses as $r) { if (($r['type'] ?? '')==='success') $success[]=$r['msg'] ?? ''; else $error[]=$r['msg'] ?? ''; }
+
+            $stories_log('CTRL_STORY_VIDEO_DONE', ['success'=>$success, 'error'=>$error]);
+
+            if ($success) $this->session->set_flashdata('msg_success',implode('<br>',array_filter($success)));
+            if ($error)   $this->session->set_flashdata('msg',implode('<br>',array_filter($error)));
+
+            if ($this->input->is_ajax_request()){
                 $this->send_json([
-                    'success'=>true,
+                    'success'=>empty(array_filter($error)),
                     'messages'=>array_merge(
-                        array_map(fn($s)=>['type'=>'success','msg'=>$s],$success),
-                        array_map(fn($e)=>['type'=>'error','msg'=>$e],$error)
+                        array_map(fn($s)=>['type'=>'success','msg'=>$s],array_filter($success)),
+                        array_map(fn($e)=>['type'=>'error','msg'=>$e],array_filter($error))
                     )
-                ]);
+                ], empty(array_filter($error))?200:400);
                 return;
             }
             redirect('reels/list'); return;
-        }
 
-        /* ريلز */
-        if(empty($_FILES['video_files']['name'][0])){
-            $this->session->set_flashdata('msg','اختر ملفات فيديو.');
-            redirect('reels/upload'); return;
-        }
-
-        $global_desc = trim(xss_clean((string)$this->input->post('description')));
-        $descs       = $this->input->post('descriptions') ?: [];
-        $sched_local = $this->input->post('schedule_times') ?: [];
-        $comments    = $this->input->post('comments') ?: [];
-        $tz_offset   = (int)($this->input->post('tz_offset_minutes') ?? 0);
-        $tz_name     = trim((string)$this->input->post('tz_name'));
-
-        $names=$_FILES['video_files']['name'];
-        $tmps =$_FILES['video_files']['tmp_name'];
-        $sizes=$_FILES['video_files']['size'];
-        $errs =$_FILES['video_files']['error'];
-        $count=count($names);
-
-        if($count>self::MAX_SCHEDULE_FILES){
-            $this->session->set_flashdata('msg','عدد الملفات كبير.');
-            redirect('reels/upload'); return;
-        }
-
-        $scheduled=[]; $immediate=[];
-        for($i=0;$i<$count;$i++){
-            $local=$sched_local[$i] ?? '';
-            if($local===''){ $immediate[]=$i; continue; }
-            $utc=$this->localToUtc($local,$tz_offset);
-            if($this->isFutureUtc($utc)) $scheduled[]=$i; else $immediate[]=$i;
-        }
-        $this->dbg('classification',['scheduled'=>$scheduled,'immediate'=>$immediate]);
-
-        $scheduled_msg='';
-        if($scheduled){
-            $scheduled_msg=$this->scheduleBatch(
-                $uid,$fb_page_ids,$scheduled,
-                $names,$tmps,$sizes,$errs,
-                $descs,$global_desc,$sched_local,
-                $tz_offset,$tz_name,$comments
-            );
-        }
-
-        $immediate_msgs=[];
-        if($immediate){
-            $subsetFiles=$this->subsetFiles($_FILES,'video_files',$immediate);
-            $subsetPost=[
-                'fb_page_ids'=>$fb_page_ids,'descriptions'=>[],
-                'schedule_times'=>[],'comments'=>[],
-                'tz_offset_minutes'=>$tz_offset,'tz_name'=>$tz_name,
-                'description'=>$global_desc,'selected_hashtags'=>$this->input->post('selected_hashtags')
-            ];
-            $newIdx=0;
-            foreach($immediate as $orig){
-                $subsetPost['descriptions'][$newIdx]=$descs[$orig] ?? '';
-                $subsetPost['schedule_times'][$newIdx]=$sched_local[$orig] ?? '';
-                $subsetPost['comments'][$newIdx]=$comments[$orig] ?? [];
-                $newIdx++;
+        } catch (Throwable $e) {
+            log_message('error','story_video_fatal: '.$e->getMessage().' @'.$e->getFile().':'.$e->getLine());
+            $stories_log('CTRL_STORY_VIDEO_FATAL', ['msg'=>$e->getMessage(),'file'=>$e->getFile(),'line'=>$e->getLine()]);
+            if ($this->input->is_ajax_request()){
+                $this->send_json(['success'=>false,'error'=>'internal_error','message'=>$e->getMessage()],500);
+                return;
             }
-            $immediate_msgs=$this->Reel_model->upload_reels($uid,$pages,$subsetPost,$subsetFiles);
+            $this->session->set_flashdata('msg','حصل خطأ داخلي أثناء نشر ستوري الفيديو.');
+            redirect('reels/upload'); return;
         }
-
-        $success=[]; $error=[];
-        if($scheduled_msg) $success[]=$scheduled_msg;
-        foreach($immediate_msgs as $m){
-            if($m['type']==='success') $success[]=$m['msg']; else $error[]=$m['msg'];
-        }
-
-        if($success) $this->session->set_flashdata('msg_success',implode('<br>',$success));
-        if($error)   $this->session->set_flashdata('msg',implode('<br>',$error));
-
-        if($this->input->is_ajax_request()){
-            $this->send_json([
-                'success'=>true,
-                'messages'=>array_merge(
-                    array_map(fn($s)=>['type'=>'success','msg'=>$s],$success),
-                    array_map(fn($e)=>['type'=>'error','msg'=>$e],$error)
-                )
-            ]);
-            return;
-        }
-        redirect('reels/list');
     }
 
-    private function scheduleBatch(
-        int $uid,array $page_ids,array $file_indices,
-        array $names,array $tmps,array $sizes,array $errs,
-        array $descs,string $global_desc,array $sched_local,
-        int $tz_offset,string $tz_name,array $comments_raw
-    ): string
-    {
-        $absDir=FCPATH.self::SCHEDULE_DIR;
-        if(!is_dir($absDir)) mkdir($absDir,0775,true);
+    /* ريلز */
+    if (empty($_FILES['video_files']['name'][0])) {
+        $this->session->set_flashdata('msg','اختر ملفات فيديو.');
+        redirect('reels/upload'); return;
+    }
 
-        $selected_tags = trim((string)$this->input->post('selected_hashtags'));
-        $rows=[]; $now=gmdate('Y-m-d H:i:s'); $saved=0; $mapIdxToPages=[];
-        foreach($file_indices as $i){
-            if(!isset($names[$i])||$names[$i]==='') continue;
-            if(!empty($errs[$i]) && $errs[$i] != UPLOAD_ERR_OK) continue;
-            $tmp=$tmps[$i];
-            if(!is_file($tmp)) continue;
-            $ext=strtolower(pathinfo($names[$i],PATHINFO_EXTENSION));
-            $size=(int)$sizes[$i];
-            if(!in_array($ext,self::ALLOWED_EXTENSIONS) || $size < self::MIN_FILE_SIZE_BYTES) continue;
+    $global_desc = trim(xss_clean((string)$this->input->post('description')));
+    $descs       = $this->input->post('descriptions') ?: [];
+    $sched_local = $this->input->post('schedule_times') ?: [];
+    $comments    = $this->input->post('comments') ?: [];
+    $tz_offset   = (int)($this->input->post('tz_offset_minutes') ?? 0);
+    $tz_name     = trim((string)$this->input->post('tz_name'));
 
-            $local=$sched_local[$i] ?? '';
-            $utc  =$this->localToUtc($local,$tz_offset);
-            if(!$this->isFutureUtc($utc)) continue;
+    $names = $_FILES['video_files']['name'];
+    $tmps  = $_FILES['video_files']['tmp_name'];
+    $sizes = $_FILES['video_files']['size'];
+    $errs  = $_FILES['video_files']['error'];
+    $count = count($names);
 
-            $file_desc=trim($descs[$i] ?? '');
-            $base=pathinfo($names[$i],PATHINFO_FILENAME);
-            if($file_desc!=='') $desc=$file_desc;
-            elseif($global_desc!=='') $desc=$global_desc;
-            else $desc=$base;
-            if($selected_tags!==''){
-                foreach(preg_split('/\s+/u',$selected_tags) as $tg){
-                    if($tg==='') continue;
-                    if(stripos($desc,$tg)===false) $desc.=' '.$tg;
-                }
+    if ($count > self::MAX_SCHEDULE_FILES) {
+        $this->session->set_flashdata('msg','عدد الملفات كبير.');
+        redirect('reels/upload'); return;
+    }
+
+    $scheduled=[]; $immediate=[];
+    for ($i=0; $i<$count; $i++) {
+        $local = $sched_local[$i] ?? '';
+        if ($local===''){ $immediate[]=$i; continue; }
+        $utc = $this->localToUtc($local, $tz_offset);
+        if ($this->isFutureUtc($utc)) $scheduled[]=$i; else $immediate[]=$i;
+    }
+    $this->dbg('classification',['scheduled'=>$scheduled,'immediate'=>$immediate]);
+
+    $scheduled_msg='';
+    if ($scheduled) {
+        $scheduled_msg = $this->scheduleBatch(
+            $uid, $valid_pages, $scheduled,
+            $names, $tmps, $sizes, $errs,
+            $descs, $global_desc, $sched_local,
+            $tz_offset, $tz_name, $comments
+        );
+    }
+
+    $immediate_msgs=[];
+    if ($immediate) {
+        $subsetFiles = $this->subsetFiles($_FILES,'video_files',$immediate);
+        $subsetPost  = [
+            'fb_page_ids'      => $valid_pages,
+            'descriptions'     => [],
+            'schedule_times'   => [],
+            'comments'         => [],
+            'tz_offset_minutes'=> $tz_offset,
+            'tz_name'          => $tz_name,
+            'description'      => $global_desc,
+            'selected_hashtags'=> $this->input->post('selected_hashtags')
+        ];
+        $newIdx=0;
+        foreach ($immediate as $orig) {
+            $subsetPost['descriptions'][$newIdx]   = $descs[$orig] ?? '';
+            $subsetPost['schedule_times'][$newIdx] = $sched_local[$orig] ?? '';
+            $subsetPost['comments'][$newIdx]       = $comments[$orig] ?? [];
+            $newIdx++;
+        }
+        $immediate_msgs = $this->Reel_model->upload_reels($uid, $pagesTokens, $subsetPost, $subsetFiles);
+    }
+
+    $success=[]; $error=[];
+    if ($scheduled_msg) $success[] = $scheduled_msg;
+    foreach ($immediate_msgs as $m){
+        if (($m['type'] ?? '')==='success') $success[]=$m['msg'] ?? ''; else $error[]=$m['msg'] ?? '';
+    }
+
+    if ($success) $this->session->set_flashdata('msg_success', implode('<br>', array_filter($success)));
+    if ($error)   $this->session->set_flashdata('msg', implode('<br>', array_filter($error)));
+
+    if ($this->input->is_ajax_request()){
+        $this->send_json([
+            'success'=> empty(array_filter($error)),
+            'messages'=> array_merge(
+                array_map(fn($s)=>['type'=>'success','msg'=>$s], array_filter($success)),
+                array_map(fn($e)=>['type'=>'error','msg'=>$e], array_filter($error))
+            )
+        ], empty(array_filter($error)) ? 200 : 400);
+        return;
+    }
+    redirect('reels/list');
+}
+private function scheduleBatch(
+    int $uid,array $page_ids,array $file_indices,
+    array $names,array $tmps,array $sizes,array $errs,
+    array $descs,string $global_desc,array $sched_local,
+    int $tz_offset,string $tz_name,array $comments_raw
+): string
+{
+    $absDir=FCPATH.self::SCHEDULE_DIR;
+    if(!is_dir($absDir)) @mkdir($absDir,0775,true);
+
+    $selected_tags = trim((string)$this->input->post('selected_hashtags'));
+    $rows=[]; $now=gmdate('Y-m-d H:i:s'); $saved=0; $mapIdxToPages=[];
+
+    // هل جدول scheduled_reels فيه عمود media_type؟
+    $hasMediaType = $this->db->field_exists('media_type','scheduled_reels');
+
+    foreach($file_indices as $i){
+        if(!isset($names[$i])||$names[$i]==='') continue;
+        if(!empty($errs[$i]) && $errs[$i] != UPLOAD_ERR_OK) continue;
+        $tmp=$tmps[$i];
+        if(!is_file($tmp)) continue;
+
+        $ext=strtolower(pathinfo($names[$i],PATHINFO_EXTENSION));
+        $size=(int)$sizes[$i];
+        if(!in_array($ext,self::ALLOWED_EXTENSIONS) || $size < self::MIN_FILE_SIZE_BYTES) continue;
+
+        $local=$sched_local[$i] ?? '';
+        $utc  =$this->localToUtc($local,$tz_offset);
+        if(!$this->isFutureUtc($utc)) continue;
+
+        $file_desc=trim($descs[$i] ?? '');
+        $base=pathinfo($names[$i],PATHINFO_FILENAME);
+        if($file_desc!=='') $desc=$file_desc;
+        elseif($global_desc!=='') $desc=$global_desc;
+        else $desc=$base;
+        if($selected_tags!==''){
+            foreach(preg_split('/\s+/u',$selected_tags) as $tg){
+                if($tg==='') continue;
+                if(stripos($desc,$tg)===false) $desc.=' '.$tg;
             }
-
-            $safe=preg_replace('/[^a-zA-Z0-9_\-\.]/','_',$names[$i]);
-            $fname='reel_'.time().'_'.$i.'_'.mt_rand(1000,9999).'_'.$safe;
-            if(!move_uploaded_file($tmp,$absDir.$fname)) continue;
-
-            $saved++;
-            $original_local_time = preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/',$local)
-                ? str_replace('T',' ',$local).':00'
-                : null;
-
-            foreach($page_ids as $pid){
-                $rows[]=[
-                    'user_id'=>$uid,'fb_page_id'=>$pid,'video_path'=>self::SCHEDULE_DIR.$fname,
-                    'description'=>$desc,'scheduled_time'=>$utc,'original_local_time'=>$original_local_time,
-                    'original_offset_minutes'=>$tz_offset,'original_timezone'=>$tz_name,
-                    'status'=>'pending','attempt_count'=>0,'processing'=>0,'created_at'=>$now
-                ];
-            }
-            $mapIdxToPages[$i]=$page_ids;
         }
 
-        if(!$rows) return 'لم يتم جدولة أي ملف.';
+        $safe=preg_replace('/[^a-zA-Z0-9_\-\.]/','_',$names[$i]);
+        $fname='reel_'.time().'_'.$i.'_'.mt_rand(1000,9999).'_'.$safe;
+        if(!move_uploaded_file($tmp,$absDir.$fname)) continue;
 
-        $this->db->insert_batch('scheduled_reels',$rows);
+        $saved++;
+        $original_local_time = preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/',$local)
+            ? str_replace('T',' ',$local).':00'
+            : null;
 
-        // تحديث إحصائيات الصفحات
         foreach($page_ids as $pid){
-            $this->db->set('last_scheduled_at', $now, false)
-                     ->set('scheduled_count','scheduled_count+'.$saved,false)
-                     ->where('user_id',$uid)->where('fb_page_id',$pid)
-                     ->update('facebook_pages');
-        }
+            $row = [
+                'user_id'                  => $uid,
+                'fb_page_id'               => $pid,
+                'video_path'               => self::SCHEDULE_DIR.$fname,
+                'description'              => $desc,
+                'scheduled_time'           => $utc,
+                'original_local_time'      => $original_local_time,
+                'original_offset_minutes'  => $tz_offset,
+                'original_timezone'        => $tz_name,
+                'status'                   => 'pending',  // رجّعناها زي الأول
+                'attempt_count'            => 0,
+                'processing'               => 0,
+                'created_at'               => $now
+            ];
+            // فقط لو العمود موجود
+            if ($hasMediaType) $row['media_type'] = 'reel';
 
-        if($comments_raw && $this->db->table_exists('scheduled_comments')){
-            $added=count($rows);
-            $rowsInserted=$this->db->order_by('id','DESC')->limit($added)->get('scheduled_reels')->result_array();
-            usort($rowsInserted, fn($a,$b)=>$a['id'] <=> $b['id']);
-            $cursor=0; $fileMap=[];
-            foreach($file_indices as $ix){
-                foreach($mapIdxToPages[$ix] as $pid){
-                    if(!isset($rowsInserted[$cursor])) break;
-                    $fileMap[$ix][$pid]=$rowsInserted[$cursor]['id'];
-                    $cursor++;
-                }
-            }
-            $nowUTC=gmdate('Y-m-d H:i:s');
-            $insertC=[];
-            foreach($comments_raw as $fileIndex=>$cRows){
-                if(!isset($fileMap[$fileIndex])||!is_array($cRows)) continue;
-                foreach($cRows as $cRow){
-                    $text=trim($cRow['text'] ?? '');
-                    $local=trim($cRow['schedule'] ?? '');
-                    if($text==='') continue;
-                    $schedUTC = $local ? $this->localToUtc($local,$tz_offset) : $nowUTC;
-                    foreach($fileMap[$fileIndex] as $pid=>$schedReelId){
-                        $insertC[]=[
-                            'scheduled_reel_id'=>$schedReelId,'user_id'=>$uid,'fb_page_id'=>$pid,
-                            'video_id'=>NULL,'comment_text'=>$text,'scheduled_time'=>$schedUTC,
-                            'status'=>'pending','attempt_count'=>0,'last_error'=>NULL,'created_at'=>$nowUTC
-                        ];
-                    }
-                }
-            }
-            if($insertC) $this->db->insert_batch('scheduled_comments',$insertC);
+            $rows[] = $row;
         }
-        return 'تمت جدولة '.$saved.' ملف/ملفات.';
+        $mapIdxToPages[$i]=$page_ids;
     }
 
+    if(!$rows) return 'لم يتم جدولة أي ملف.';
+
+    $this->db->insert_batch('scheduled_reels',$rows);
+
+    // تحديث إحصائيات الصفحات — فقط إذا كان جدول facebook_pages موجود والأعمدة موجودة
+    if ($this->db->table_exists('facebook_pages')) {
+        $hasLastScheduled = $this->db->field_exists('last_scheduled_at','facebook_pages');
+        $hasSchedCount    = $this->db->field_exists('scheduled_count','facebook_pages');
+        if ($hasLastScheduled || $hasSchedCount) {
+            foreach($page_ids as $pid){
+                $this->db->where('user_id',$uid)->where('fb_page_id',$pid);
+                if ($hasLastScheduled) {
+                    $this->db->set('last_scheduled_at', $now);
+                }
+                if ($hasSchedCount) {
+                    $this->db->set('scheduled_count','scheduled_count+'.$saved,false);
+                }
+                $this->db->update('facebook_pages');
+            }
+        }
+    }
+
+    if($comments_raw && $this->db->table_exists('scheduled_comments')){
+        $added=count($rows);
+        $rowsInserted=$this->db->order_by('id','DESC')->limit($added)->get('scheduled_reels')->result_array();
+        usort($rowsInserted, fn($a,$b)=>$a['id'] <=> $b['id']);
+        $cursor=0; $fileMap=[];
+        foreach($file_indices as $ix){
+            foreach($mapIdxToPages[$ix] as $pid){
+                if(!isset($rowsInserted[$cursor])) break;
+                $fileMap[$ix][$pid]=$rowsInserted[$cursor]['id'];
+                $cursor++;
+            }
+        }
+        $nowUTC=gmdate('Y-m-d H:i:s');
+        $insertC=[];
+        foreach($comments_raw as $fileIndex=>$cRows){
+            if(!isset($fileMap[$fileIndex])||!is_array($cRows)) continue;
+            foreach($cRows as $cRow){
+                $text=trim($cRow['text'] ?? '');
+                $local=trim($cRow['schedule'] ?? '');
+                if($text==='') continue;
+                $schedUTC = $local ? $this->localToUtc($local,$tz_offset) : $nowUTC;
+                foreach($fileMap[$fileIndex] as $pid=>$schedReelId){
+                    $insertC[]=[
+                        'scheduled_reel_id'=>$schedReelId,'user_id'=>$uid,'fb_page_id'=>$pid,
+                        'video_id'=>NULL,'comment_text'=>$text,'scheduled_time'=>$schedUTC,
+                        'status'=>'pending','attempt_count'=>0,'last_error'=>NULL,'created_at'=>$nowUTC
+                    ];
+                }
+            }
+        }
+        if($insertC) $this->db->insert_batch('scheduled_comments',$insertC);
+    }
+    return 'تمت جدولة '.$saved.' ملف/ملفات.';
+}
     /* ======================== Listing ======================== */
 
     public function list()
@@ -513,41 +913,82 @@ class Reels extends CI_Controller
     /* ======================== Cron Jobs ======================== */
 
     public function cron_publish($token=null)
-    {
-        if(!$this->input->is_cli_request()){
-            if($token!==self::CRON_TOKEN){ show_error('Unauthorized',403); return; }
-        }
-        $lock=sys_get_temp_dir().'/reels_cron.lock';
-        $fh=fopen($lock,'c+');
-        if(!$fh || !flock($fh,LOCK_EX|LOCK_NB)){ echo "Another instance running\n"; return; }
-        $due=$this->Reel_model->get_due_scheduled_reels(40);
-        foreach($due as $r){
-            if(self::FEATURE_STORIES && isset($r['media_type'])){
-                if($r['media_type']==='story_video' && method_exists($this->Reel_model,'publish_scheduled_story_video')){
-                    $this->Reel_model->publish_scheduled_story_video($r); continue;
-                }
-                if($r['media_type']==='story_photo' && method_exists($this->Reel_model,'publish_scheduled_story_photo')){
-                    $this->Reel_model->publish_scheduled_story_photo($r); continue;
-                }
-            }
-            $this->Reel_model->process_scheduled_reel($r);
-        }
-        echo "Processed ".count($due)." scheduled items.\n";
-        flock($fh,LOCK_UN); fclose($fh);
+{
+    if(!$this->input->is_cli_request()){
+        if($token!==self::CRON_TOKEN){ show_error('Unauthorized',403); return; }
     }
 
+    // لوج سريع في stories_api.log
+    $stories_log = function(string $label, array $ctx = []) {
+        $dir = FCPATH.'application/logs/';
+        if (!is_dir($dir)) @mkdir($dir, 0775, true);
+        $line = '['.gmdate('Y-m-d H:i:s')."] $label";
+        if (!empty($ctx)) $line .= ' '.json_encode($ctx, JSON_UNESCAPED_UNICODE);
+        @file_put_contents($dir.'stories_api.log', $line.PHP_EOL, FILE_APPEND);
+    };
+
+    $this->withLock('reels_cron.lock', function () use ($stories_log) {
+        $now = gmdate('Y-m-d H:i:s');
+        $due = $this->Reel_model->get_due_scheduled_reels(40);
+        $stories_log('CRON_RUN', ['now'=>$now, 'due_count'=>count($due)]);
+
+        foreach($due as $r){
+            $id = (int)($r['id'] ?? 0);
+            $mt = (string)($r['media_type'] ?? '');
+            $vp = (string)($r['video_path'] ?? '');
+            $pid = (string)($r['fb_page_id'] ?? '');
+
+            $stories_log('CRON_PICK', [
+                'id'=>$id,'media_type'=>$mt,'page'=>$pid,'path'=>$vp,'scheduled_time'=>($r['scheduled_time'] ?? null)
+            ]);
+
+            // اكتشف نوع الصورة تلقائياً لو media_type غير مذكور
+            $ext = strtolower(pathinfo($vp, PATHINFO_EXTENSION));
+            $isImage = in_array($ext, ['jpg','jpeg','png','webp','gif'], true);
+
+            try {
+                if (self::FEATURE_STORIES) {
+                    if ($mt === 'story_photo' || ($mt === '' && $isImage)) {
+                        if (method_exists($this->Reel_model,'publish_scheduled_story_photo')) {
+                            $this->Reel_model->publish_scheduled_story_photo($r);
+                            continue;
+                        } else {
+                            $stories_log('CRON_WARN', ['id'=>$id,'msg'=>'publish_scheduled_story_photo missing']);
+                        }
+                    }
+                    if ($mt === 'story_video') {
+                        if (method_exists($this->Reel_model,'publish_scheduled_story_video')) {
+                            $this->Reel_model->publish_scheduled_story_video($r);
+                            continue;
+                        } else {
+                            $stories_log('CRON_WARN', ['id'=>$id,'msg'=>'publish_scheduled_story_video missing']);
+                        }
+                    }
+                }
+
+                // الافتراضي: ريلز فيديو
+                $this->Reel_model->process_scheduled_reel($r);
+
+            } catch (Throwable $e) {
+                $stories_log('CRON_EXCEPTION', ['id'=>$id,'msg'=>$e->getMessage(),'file'=>$e->getFile(),'line'=>$e->getLine()]);
+                // اترك الموديل يعالج حالات الفشل الداخلية لو بيعمل كده، وإلا اعمل update هنا
+            }
+        }
+
+        $stories_log('CRON_DONE', []);
+        echo "Processed ".count($due)." scheduled items.\n";
+    });
+}
     public function cron_comments($token=null)
     {
         if(!$this->input->is_cli_request()){
             if($token!==self::CRON_TOKEN){ show_error('Unauthorized',403); return; }
         }
-        $lock=sys_get_temp_dir().'/reels_comments.lock';
-        $fh=fopen($lock,'c+');
-        if(!$fh || !flock($fh,LOCK_EX|LOCK_NB)){ echo "Another instance running\n"; return; }
-        $rows=$this->Reel_model->get_due_scheduled_comments(80);
-        foreach($rows as $r){ $this->Reel_model->process_scheduled_comment($r); }
-        echo "Processed ".count($rows)." scheduled comments.\n";
-        flock($fh,LOCK_UN); fclose($fh);
+        $this->withLock('reels_comments.lock', function () {
+            $rows=$this->Reel_model->get_due_scheduled_comments(80);
+            foreach($rows as $r){ $this->Reel_model->process_scheduled_comment($r); }
+            echo "Processed ".count($rows)." scheduled comments.\n";
+        });
     }
 
     /* ======================== Pages View ======================== */
