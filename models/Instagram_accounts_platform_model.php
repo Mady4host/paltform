@@ -57,7 +57,7 @@ class Instagram_accounts_platform_model extends CI_Model
         $this->db->from($this->table);
         $this->db->where('user_id', (int)$user_id);
         $this->db->where('has_instagram', '1');
-        $this->db->where("COALESCE(instagram_business_account_id,'') <> '', false);
+        $this->db->where("COALESCE(instagram_business_account_id,'') <> ''", null, false);
         if ($requireLinked) {
             $this->db->where('ig_linked', 1);
         }
