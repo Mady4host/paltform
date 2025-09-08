@@ -3,19 +3,9 @@
  * صفحة رفع / نشر إنستجرام متعددة الملفات (نسخة محدثة لدمج منطق التوقيت المحلي → UTC)
  *
  * الجديد / التعديلات:
- * 1) إضافة الحقل المخفي _tz_offset (بالدقائق من getTimezoneOffset) بجانب _tz_name.
- * 2) شارة توضيحية أعلى النموذج تبين المنطقة الزمنية + Offset وحقيقة التخزين UTC.
- * 3) معاينة فورية لكل خانة وقت (Local → UTC) أسفل الحقل داخل بطاقة الملف.
- * 4) فحص أقصى: (الوقت يجب أن يكون بعد الآن + 30 ثانية) بدلاً من مقارنة دقيقة ناقص.
- * 5) تحسين زر "فحص التوقيت" ليستخدم نفس خوارزمية التحويل المستعملة في السيرفر (UTC = Local + offsetMinutes).
- * 6) تحسين validateSchedules برسائل أدق وعتبة 30 ثانية مستقبلية.
- * 7) إصلاح حساب UTC في المعاينات (كان يُستعمل Date.parse مع استبدال T، الآن نستعمل كائن Date مباشرة).
- * 8) إضافة Pending تهيئة: ضبط min = الآن + 2 دقيقة لكل datetime-local عند توليد الصف.
- * 9) كود أكثر تنظيماً للتحويل (دالة toUtcFromLocalInput).
- *
- * ملاحظات:
- * - السيرفر يستقبل: _tz_offset (دقائق) و _tz_name، ويحول نفس منطق فيسبوك.
- * - حقول الجدولة بصيغة datetime-local بدون ثوانٍ، نضيف :00 في السيرفر.
+ * - إصلاح اختيار الحساب: استبدال label بحاوية div لمنع "القلب المزدوج".
+ * - إضافة مربع اختيار ظاهر لكل حساب + ضغط على الكارت يغيّر حالته.
+ * - مزامنة ig_user_id (الحساب الأساسي) تلقائياً بأول حساب محدد.
  */
 ?>
 <!DOCTYPE html>
@@ -56,14 +46,18 @@ h1{font-size:26px;font-weight:700;margin:0;}
 .accounts-list{max-height:470px;overflow:auto;padding-right:4px;}
 .accounts-list::-webkit-scrollbar{width:8px;} .accounts-list::-webkit-scrollbar-thumb{background:#c4d2df;border-radius:4px;}
 .theme-dark .accounts-list::-webkit-scrollbar-thumb{background:#314556;}
-.account-item{display:flex;align-items:center;gap:12px;padding:10px 12px;border:1px solid var(--c-panel-border);background:var(--c-muted-bg);border-radius:14px;margin-bottom:10px;cursor:pointer;transition:.22s;}
+/* حسابات */
+.account-item{display:flex;align-items:center;gap:12px;padding:10px 12px;border:1px solid var(--c-panel-border);background:var(--c-muted-bg);border-radius:14px;margin-bottom:10px;cursor:pointer;transition:.22s; user-select:none;}
 .account-item:hover{border-color:var(--c-accent);}
-.account-item.selected{border-color:var(--c-accent);background:rgba(13,110,253,.1);box-shadow:0 0 0 2px rgba(13,110,253,.2);}
+.account-item.selected{border-color:var(--c-accent);background:rgba(13,110,253,.08);box-shadow:0 0 0 2px rgba(13,110,253,.18);}
 .theme-dark .account-item.selected{background:#22374b;}
-.acc-avatar{width:48px;height:48px;border-radius:50%;object-fit:cover;border:2px solid var(--c-panel-border);background:#eee;}
+.acc-check{transform:scale(1.15); cursor:pointer; margin-inline-start:4px;}
+.acc-avatar{width:48px;height:48px;border-radius:50%;object-fit:cover;border:2px solid var(--c-panel-border);background:#eee;flex:0 0 auto;}
 .theme-dark .acc-avatar{background:#111d27;}
+.acc-info{display:flex;flex-direction:column;gap:2px;}
 .acc-info .uname{font-weight:700;font-size:13px;direction:ltr;text-align:left;}
-.muted{color:var(--c-text-soft)!important;font-size:12.3px;}
+.muted{color:var(--c-text-soft)!important;font-size:11.3px;}
+/* الملفات */
 .file-drop{border:2px dashed #b9c9d6;border-radius:18px;background:var(--c-muted-bg);padding:26px;text-align:center;cursor:pointer;transition:.25s;}
 .file-drop:hover{border-color:var(--c-accent);background:#e9f2fb;}
 .theme-dark .file-drop{border-color:#395265;background:#1e2f3b;}
@@ -177,7 +171,7 @@ h1{font-size:26px;font-weight:700;margin:0;}
                     <span class="ico">🔍</span>
                 </div>
 
-                <div class="d-flex gap-2 flex-wrap mb-2">
+                <div class="d-flex gap-2 flex-wrap mb-2 align-items-center">
                     <button type="button" class="btn btn-sm btn-primary" id="btnSelectAllAccounts">تحديد الكل</button>
                     <button type="button" class="btn btn-sm btn-outline-secondary" id="btnClearAccounts">إلغاء</button>
                 </div>
@@ -187,15 +181,17 @@ h1{font-size:26px;font-weight:700;margin:0;}
                         $pic = $acc['ig_profile_picture'] ?: '';
                         $fallback = 'https://via.placeholder.com/80x80?text=IG';
                         $uname = $acc['ig_username'] ?: $acc['ig_user_id'];
+                        $filterKey = strtolower(($uname ?: '').' '.($acc['page_name'] ?: ''));
+                        $uid = (string)$acc['ig_user_id'];
                     ?>
-                    <label class="account-item" data-filter="<?= htmlspecialchars(strtolower($uname.' '.$acc['page_name'])) ?>">
-                        <input type="checkbox" class="acc-multi" name="ig_user_ids[]" value="<?= htmlspecialchars($acc['ig_user_id']) ?>" style="display:none">
-                        <img class="acc-avatar" src="<?= htmlspecialchars($pic ?: $fallback) ?>" onerror="this.onerror=null;this.src='<?= $fallback ?>'">
+                    <div class="account-item" data-filter="<?= htmlspecialchars($filterKey) ?>" data-ig-card data-ig-id="<?= htmlspecialchars($uid) ?>" tabindex="0" role="button" aria-pressed="false">
+                        <input type="checkbox" class="form-check-input acc-check acc-multi" name="ig_user_ids[]" value="<?= htmlspecialchars($uid) ?>">
+                        <img class="acc-avatar" src="<?= htmlspecialchars($pic ?: $fallback) ?>" onerror="this.onerror=null;this.src='<?= $fallback ?>'" alt="">
                         <div class="acc-info">
                             <div class="uname">@<?= htmlspecialchars($uname) ?></div>
-                            <div class="muted" style="font-size:11px;"><?= htmlspecialchars($acc['page_name']) ?></div>
+                            <div class="muted"><?= htmlspecialchars($acc['page_name'] ?: '') ?></div>
                         </div>
-                    </label>
+                    </div>
                     <?php endforeach; ?>
                 </div>
 
@@ -259,7 +255,7 @@ h1{font-size:26px;font-weight:700;margin:0;}
   const tzOffsetField=document.getElementById('tz_offset_field');
   const badge=document.getElementById('tzInfo');
   try{
-    const off = new Date().getTimezoneOffset(); // دقائق (موجب للغرب)
+    const off = new Date().getTimezoneOffset();
     tzOffsetField.value = off;
     tzNameField.value = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
     if(badge){
@@ -273,9 +269,8 @@ h1{font-size:26px;font-weight:700;margin:0;}
 
 /* ========= دوال تحويل الوقت للمعاينة ========= */
 function toUtcFromLocalInput(localStr){
-  // localStr = 'YYYY-MM-DDTHH:MM'
   if(!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(localStr)) return null;
-  const d = new Date(localStr); // يفسره المتصفح كـ Local
+  const d = new Date(localStr);
   if(isNaN(d.getTime())) return null;
   const pad=n=> String(n).padStart(2,'0');
   return d.getUTCFullYear()+'-'+pad(d.getUTCMonth()+1)+'-'+pad(d.getUTCDate())+' '+pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())+':00';
@@ -306,71 +301,123 @@ btnTheme?.addEventListener('click',()=>{
 const primaryAccountField=document.getElementById('primaryAccountField');
 const selCount=document.getElementById('selCount');
 const accountSearch=document.getElementById('accountSearch');
-const accItems=document.querySelectorAll('.account-item');
-function updatePrimaryAccount(){
-    const selected=[...document.querySelectorAll('.acc-multi:checked')].map(c=>c.value);
-    primaryAccountField.value=selected.length?selected[0]:'';
-    if(selected.length){
-        selCount.style.display='inline-block';
-        selCount.textContent='حسابات: '+selected.length;
-    } else selCount.style.display='none';
+const accountsContainer=document.getElementById('accountsList');
+
+function getAllBoxes(){
+  return Array.from(accountsContainer.querySelectorAll('input.acc-multi[name="ig_user_ids[]"]'));
 }
-accItems.forEach(item=>{
-    const cb=item.querySelector('.acc-multi');
-    item.addEventListener('click',(e)=>{
-        if(e.target===cb) return;
-        cb.checked=!cb.checked;
-        item.classList.toggle('selected',cb.checked);
-        updatePrimaryAccount();
-    });
+function getCheckedBoxes(){
+  return getAllBoxes().filter(b=>b.checked);
+}
+function syncCardVisuals(){
+  getAllBoxes().forEach(b=>{
+    const card=b.closest('[data-ig-card]');
+    if(card){
+      card.classList.toggle('selected', b.checked);
+      card.setAttribute('aria-pressed', b.checked ? 'true' : 'false');
+    }
+  });
+}
+function updatePrimaryAccount(){
+  const checked=getCheckedBoxes();
+  primaryAccountField.value = checked.length ? checked[0].value : '';
+  if(checked.length){
+    selCount.style.display='inline-block';
+    selCount.textContent='حسابات: '+checked.length;
+  } else {
+    selCount.style.display='none';
+  }
+  syncCardVisuals();
+}
+
+// الضغط على الكارت = توجل الشيك بوكس بدون تعارض
+accountsContainer?.addEventListener('click', (e)=>{
+  const card = e.target.closest('[data-ig-card]');
+  if(!card || !accountsContainer.contains(card)) return;
+  const inputClicked = e.target.closest('input.acc-multi');
+  if(inputClicked){
+    // لو الكليك على الشيك بوكس نفسه، التغيير هيحصل من حدث change
+    return;
+  }
+  const box = card.querySelector('input.acc-multi');
+  if(!box) return;
+  box.checked = !box.checked;
+  // اطلق change لنحافظ على مسار واحد للمزامنة
+  box.dispatchEvent(new Event('change', {bubbles:true}));
 });
+
+// كيبورد: Enter/Space على الكارت
+accountsContainer?.addEventListener('keydown', (e)=>{
+  if(!(e.key==='Enter' || e.key===' ')) return;
+  const card = e.target.closest('[data-ig-card]');
+  if(!card) return;
+  e.preventDefault();
+  const box = card.querySelector('input.acc-multi');
+  if(!box) return;
+  box.checked = !box.checked;
+  box.dispatchEvent(new Event('change',{bubbles:true}));
+});
+
+// مزامنة عند تغير أي شيك بوكس
+accountsContainer?.addEventListener('change', (e)=>{
+  const box = e.target.closest('input.acc-multi');
+  if(!box) return;
+  updatePrimaryAccount();
+});
+
+// أزرار التحكم
 document.getElementById('btnSelectAllAccounts')?.addEventListener('click',()=>{
-    const boxes=[...document.querySelectorAll('.acc-multi')];
-    const all=boxes.every(b=>b.checked);
-    boxes.forEach(b=>{
-        b.checked=!all;
-        b.closest('.account-item').classList.toggle('selected',b.checked);
-    });
-    updatePrimaryAccount();
+  const boxes=getAllBoxes();
+  const all=boxes.every(b=>b.checked);
+  boxes.forEach(b=>b.checked=!all);
+  updatePrimaryAccount();
 });
 document.getElementById('btnClearAccounts')?.addEventListener('click',()=>{
-    document.querySelectorAll('.acc-multi').forEach(b=>{
-        b.checked=false;
-        b.closest('.account-item').classList.remove('selected');
-    });
-    updatePrimaryAccount();
+  getAllBoxes().forEach(b=>b.checked=false);
+  updatePrimaryAccount();
 });
+
+// بحث
 accountSearch?.addEventListener('input',e=>{
-    const q=e.target.value.toLowerCase();
-    accItems.forEach(it=>{
-        const f=it.getAttribute('data-filter');
-        it.style.display=f.includes(q)?'flex':'none';
-    });
+  const q=(e.target.value||'').toLowerCase();
+  accountsContainer.querySelectorAll('[data-ig-card]').forEach(card=>{
+    const f=(card.getAttribute('data-filter')||'').toLowerCase();
+    card.style.display = f.includes(q) ? 'flex' : 'none';
+  });
 });
+
+// اختيار تلقائي لأول حساب في أول مرة لو ماحدّدش
+(function autoSelectFirstIfNone(){
+  const boxes=getAllBoxes();
+  if(boxes.length && getCheckedBoxes().length===0){
+    boxes[0].checked=true;
+  }
+  updatePrimaryAccount();
+})();
 
 /* ========= نوع المحتوى ========= */
 const kindReel=document.getElementById('kindReel');
 const kindStory=document.getElementById('kindStory');
 [kindReel,kindStory].forEach(r=>r?.addEventListener('change',applyKindModeToAll));
 function applyKindModeToAll(){
-    const isStory=kindStory.checked;
-    document.querySelectorAll('.file-card').forEach(card=>{
-        const tabs=card.querySelectorAll('.tab-btn');
-        tabs.forEach(tb=>{
-            if(['caption','comments','hashtags'].includes(tb.dataset.tab)){
-                tb.style.display=isStory?'none':'inline-block';
-                if(isStory && tb.classList.contains('active')){
-                    card.querySelector('.tab-btn[data-tab="publish"]').click();
-                }
-            }
-        });
-        card.querySelectorAll('.tab-pane').forEach(p=>{
-            if(['caption','comments','hashtags'].includes(p.dataset.pane)){
-                p.style.display=isStory?'none':'';
-                if(isStory) p.classList.remove('active');
-            }
-        });
+  const isStory=kindStory.checked;
+  document.querySelectorAll('.file-card').forEach(card=>{
+    const tabs=card.querySelectorAll('.tab-btn');
+    tabs.forEach(tb=>{
+      if(['caption','comments','hashtags'].includes(tb.dataset.tab)){
+        tb.style.display=isStory?'none':'inline-block';
+        if(isStory && tb.classList.contains('active')){
+          card.querySelector('.tab-btn[data-tab="publish"]').click();
+        }
+      }
     });
+    card.querySelectorAll('.tab-pane').forEach(p=>{
+      if(['caption','comments','hashtags'].includes(p.dataset.pane)){
+        p.style.display=isStory?'none':'';
+        if(isStory) p.classList.remove('active');
+      }
+    });
+  });
 }
 
 /* ========= الملفات ========= */
@@ -383,304 +430,304 @@ fileDrop?.addEventListener('click',()=>filesInput.click());
 fileDrop?.addEventListener('dragover',e=>{e.preventDefault();fileDrop.classList.add('dragover');});
 fileDrop?.addEventListener('dragleave',()=>fileDrop.classList.remove('dragover'));
 fileDrop?.addEventListener('drop',e=>{
-    e.preventDefault();fileDrop.classList.remove('dragover');
-    appendFiles([...e.dataTransfer.files]);
+  e.preventDefault();fileDrop.classList.remove('dragover');
+  appendFiles([...e.dataTransfer.files]);
 });
 filesInput?.addEventListener('change',()=>appendFiles([...filesInput.files],true));
 function appendFiles(fs){
-    fs.forEach(f=>masterFileList.push(f));
-    renderFiles();
+  fs.forEach(f=>masterFileList.push(f));
+  renderFiles();
 }
 function removeFile(i){
-    masterFileList=masterFileList.filter((_,idx)=>idx!==i);
-    renderFiles();
+  masterFileList=masterFileList.filter((_,idx)=>idx!==i);
+  renderFiles();
 }
 function buildPublish(i){
-    return `
-      <div class="mb-2 fw-bold small-note" style="color:var(--c-text);">وضع النشر</div>
-      <div class="d-flex gap-3 flex-wrap mb-2">
-        <label class="form-check small-note">
-          <input type="radio" class="form-check-input" name="media_cfg[${i}][publish_mode]" value="immediate" checked> الآن
-        </label>
-        <label class="form-check small-note">
-          <input type="radio" class="form-check-input pub-mode-scheduled" name="media_cfg[${i}][publish_mode]" value="scheduled"> جدولة
-        </label>
+  return `
+    <div class="mb-2 fw-bold small-note" style="color:var(--c-text);">وضع النشر</div>
+    <div class="d-flex gap-3 flex-wrap mb-2">
+      <label class="form-check small-note">
+        <input type="radio" class="form-check-input" name="media_cfg[${i}][publish_mode]" value="immediate" checked> الآن
+      </label>
+      <label class="form-check small-note">
+        <input type="radio" class="form-check-input pub-mode-scheduled" name="media_cfg[${i}][publish_mode]" value="scheduled"> جدولة
+      </label>
+    </div>
+    <div class="schedule-box" id="schBox-${i}" style="display:none;">
+      <div class="help-sched">
+        الأوقات محلية؛ سيحوّلها السيرفر تلقائياً إلى UTC ويخزن + يحفظ الأصل للعرض.
       </div>
-      <div class="schedule-box" id="schBox-${i}" style="display:none;">
-        <div class="help-sched">
-          الأوقات محلية؛ سيحوّلها السيرفر تلقائياً إلى UTC ويخزن + يحفظ الأصل للعرض.
-        </div>
-        <div class="d-flex align-items-end gap-3 flex-wrap mt-2">
-            <div>
-              <label class="form-label small mb-1">عدد الجداول</label>
-              <select class="form-select form-select-sm sch-count" name="media_cfg[${i}][schedule_count]" data-file="${i}" style="width:auto;">
-                ${Array.from({length:10},(_,k)=>`<option value="${k+1}">${k+1}</option>`).join('')}
-              </select>
-            </div>
-            <button type="button" class="btn btn-outline-secondary btn-sched-test" data-test-sched="${i}" title="فحص التوقيت">فحص التوقيت</button>
-            <div class="inline-note">30 ثانية حد أدنى قبل التنفيذ.</div>
-        </div>
-        <div class="schedule-rows mt-2" id="schRows-${i}"></div>
-      </div>`;
+      <div class="d-flex align-items-end gap-3 flex-wrap mt-2">
+          <div>
+            <label class="form-label small mb-1">عدد الجداول</label>
+            <select class="form-select form-select-sm sch-count" name="media_cfg[${i}][schedule_count]" data-file="${i}" style="width:auto;">
+              ${Array.from({length:10},(_,k)=>`<option value="${k+1}">${k+1}</option>`).join('')}
+            </select>
+          </div>
+          <button type="button" class="btn btn-outline-secondary btn-sched-test" data-test-sched="${i}" title="فحص التوقيت">فحص التوقيت</button>
+          <div class="inline-note">30 ثانية حد أدنى قبل التنفيذ.</div>
+      </div>
+      <div class="schedule-rows mt-2" id="schRows-${i}"></div>
+    </div>`;
 }
 function buildCaption(i){
-    return `
-      <label class="form-label small mb-1">الوصف</label>
-      <textarea name="media_cfg[${i}][caption]" class="form-control caption-field" maxlength="2200" placeholder="وصف الريل ..."></textarea>
-      <div class="caption-counter"><span class="cap-len">0</span> / 2200</div>`;
+  return `
+    <label class="form-label small mb-1">الوصف</label>
+    <textarea name="media_cfg[${i}][caption]" class="form-control caption-field" maxlength="2200" placeholder="وصف الريل ..."></textarea>
+    <div class="caption-counter"><span class="cap-len">0</span> / 2200</div>`;
 }
 function buildComments(i){
-    return `
-      <div class="d-flex align-items-center gap-3 mb-2">
-        <label class="form-label small mb-1">عدد التعليقات</label>
-        <select class="form-select form-select-sm comm-count" data-file="${i}" style="width:auto;">
-          ${Array.from({length:21},(_,k)=>`<option value="${k}">${k}</option>`).join('')}
-        </select>
-        <button type="button" class="btn btn-sm btn-outline-secondary comm-clear" data-file="${i}">مسح</button>
-      </div>
-      <div class="comments-list" id="commentsList-${i}" style="display:none;"></div>
-      <div class="inline-note mt-1">تعليقات تُنشر بعد نجاح الريل.</div>`;
+  return `
+    <div class="d-flex align-items-center gap-3 mb-2">
+      <label class="form-label small mb-1">عدد التعليقات</label>
+      <select class="form-select form-select-sm comm-count" data-file="${i}" style="width:auto;">
+        ${Array.from({length:21},(_,k)=>`<option value="${k}">${k}</option>`).join('')}
+      </select>
+      <button type="button" class="btn btn-sm btn-outline-secondary comm-clear" data-file="${i}">مسح</button>
+    </div>
+    <div class="comments-list" id="commentsList-${i}" style="display:none;"></div>
+    <div class="inline-note mt-1">تعليقات تُنشر بعد نجاح الريل.</div>`;
 }
 function buildHashtags(i){
-    return `
-      <div class="hash-tools d-flex flex-wrap gap-2 mb-2">
-        <button class="btn btn-sm btn-primary hash-fetch" data-file="${i}" type="button">تريند</button>
-        <button class="btn btn-sm btn-outline-success hash-add" data-file="${i}" type="button">دمج للوصف</button>
-        <button class="btn btn-sm btn-outline-secondary hash-clear" data-file="${i}" type="button">مسح</button>
-        <span class="inline-note" id="hashStatus-${i}"></span>
-      </div>
-      <div class="hashtag-wrap">
-        <textarea class="form-control form-control-sm hash-field" data-file="${i}" id="hashField-${i}" placeholder="#tags ..." rows="2"></textarea>
-      </div>
-      <div class="hashtag-tags mt-2" id="tagsList-${i}" style="display:none;"></div>`;
+  return `
+    <div class="hash-tools d-flex flex-wrap gap-2 mb-2">
+      <button class="btn btn-sm btn-primary hash-fetch" data-file="${i}" type="button">تريند</button>
+      <button class="btn btn-sm btn-outline-success hash-add" data-file="${i}" type="button">دمج للوصف</button>
+      <button class="btn btn-sm btn-outline-secondary hash-clear" data-file="${i}" type="button">مسح</button>
+      <span class="inline-note" id="hashStatus-${i}"></span>
+    </div>
+    <div class="hashtag-wrap">
+      <textarea class="form-control form-control-sm hash-field" data-file="${i}" id="hashField-${i}" placeholder="#tags ..." rows="2"></textarea>
+    </div>
+    <div class="hashtag-tags mt-2" id="tagsList-${i}" style="display:none;"></div>`;
 }
 /* ==== جدولة ==== */
 function initSchedule(card,i){
-    const radioSched=card.querySelector('.pub-mode-scheduled');
-    const box=card.querySelector('#schBox-'+i);
-    const countSel=card.querySelector('.sch-count');
-    const rows=card.querySelector('#schRows-'+i);
-    card.querySelectorAll(`input[name="media_cfg[${i}][publish_mode]"]`).forEach(r=>{
-        r.addEventListener('change',()=>{
-            box.style.display=radioSched.checked?'':'none';
-            if(radioSched.checked) rebuild();
-        });
+  const radioSched=card.querySelector('.pub-mode-scheduled');
+  const box=card.querySelector('#schBox-'+i);
+  const countSel=card.querySelector('.sch-count');
+  const rows=card.querySelector('#schRows-'+i);
+  card.querySelectorAll(`input[name="media_cfg[${i}][publish_mode]"]`).forEach(r=>{
+    r.addEventListener('change',()=>{
+      box.style.display=radioSched.checked?'':'none';
+      if(radioSched.checked) rebuild();
     });
-    countSel.addEventListener('change',rebuild);
-    function attachPreview(inp){
-        const preview=inp.closest('.schedule-row').querySelector('.sched-preview');
-        const warn30 = '<span class="text-danger"> (<30s)</span>';
-        function update(){
-            const v=inp.value.trim();
-            inp.classList.remove('is-invalid');
-            if(!v){ preview.textContent='—'; return; }
-            const utc=toUtcFromLocalInput(v);
-            if(!utc){ preview.innerHTML='<span class="text-danger">تنسيق غير صالح</span>'; inp.classList.add('is-invalid'); return; }
-            const minsUntil=minutesUntil(v);
-            const less30 = (minsUntil!==null && (minsUntil*60)<30) ? warn30 : '';
-            preview.innerHTML='UTC: <code>'+utc+'</code>'+less30;
-        }
-        inp.addEventListener('input',update);
-        update();
+  });
+  countSel.addEventListener('change',rebuild);
+  function attachPreview(inp){
+    const preview=inp.closest('.schedule-row').querySelector('.sched-preview');
+    const warn30 = '<span class="text-danger"> (&lt;30s)</span>';
+    function update(){
+      const v=inp.value.trim();
+      inp.classList.remove('is-invalid');
+      if(!v){ preview.textContent='—'; return; }
+      const utc=toUtcFromLocalInput(v);
+      if(!utc){ preview.innerHTML='<span class="text-danger">تنسيق غير صالح</span>'; inp.classList.add('is-invalid'); return; }
+      const minsUntil=minutesUntil(v);
+      const less30 = (minsUntil!==null && (minsUntil*60)<30) ? warn30 : '';
+      preview.innerHTML='UTC: <code>'+utc+'</code>'+less30;
     }
-    function rebuild(){
-        rows.innerHTML='';
-        const c=parseInt(countSel.value||'1',10);
-        for(let s=1;s<=c;s++){
-            const div=document.createElement('div');
-            div.className='schedule-row';
-            div.innerHTML=`
-              <div>
-                <label class="form-label small mb-1">وقت #${s}</label>
-                <input type="datetime-local" class="form-control form-control-sm sch-time" name="media_cfg[${i}][schedules][${s}][time]" required>
-                <div class="sched-preview"></div>
-              </div>
-              <div>
-                <label class="form-label small mb-1">تكرار</label>
-                <select class="form-select form-select-sm recurrence-select" name="media_cfg[${i}][schedules][${s}][recurrence_kind]">
-                  <option value="none">بدون</option>
-                  <option value="daily">يومي</option>
-                  <option value="weekly">أسبوعي</option>
-                  <option value="monthly">شهري</option>
-                  <option value="quarterly">كل 3 شهور</option>
-                </select>
-              </div>
-              <div class="rec-until" style="display:none;">
-                <label class="form-label small mb-1">حتى تاريخ (اختياري)</label>
-                <input type="datetime-local" class="form-control form-control-sm rec-until-input" name="media_cfg[${i}][schedules][${s}][recurrence_until]">
-              </div>
-              <div class="text-center">
-                <span class="badge bg-light text-dark" style="font-size:10px;">#${s}</span>
-              </div>`;
-            rows.appendChild(div);
-        }
-        const minLocal = new Date(Date.now()+2*60000);
-        const minStr = minLocal.toISOString().slice(0,16);
-        rows.querySelectorAll('.sch-time').forEach(inp=>{ inp.min=minStr; attachPreview(inp); });
-        rows.querySelectorAll('.recurrence-select').forEach(sel=>{
-            sel.addEventListener('change',()=>{
-                const wrap=sel.closest('.schedule-row').querySelector('.rec-until');
-                wrap.style.display= sel.value!=='none' ? '' : 'none';
-            });
-        });
+    inp.addEventListener('input',update);
+    update();
+  }
+  function rebuild(){
+    rows.innerHTML='';
+    const c=parseInt(countSel.value||'1',10);
+    for(let s=1;s<=c;s++){
+      const div=document.createElement('div');
+      div.className='schedule-row';
+      div.innerHTML=`
+        <div>
+          <label class="form-label small mb-1">وقت #${s}</label>
+          <input type="datetime-local" class="form-control form-control-sm sch-time" name="media_cfg[${i}][schedules][${s}][time]" required>
+          <div class="sched-preview"></div>
+        </div>
+        <div>
+          <label class="form-label small mb-1">تكرار</label>
+          <select class="form-select form-select-sm recurrence-select" name="media_cfg[${i}][schedules][${s}][recurrence_kind]">
+            <option value="none">بدون</option>
+            <option value="daily">يومي</option>
+            <option value="weekly">أسبوعي</option>
+            <option value="monthly">شهري</option>
+            <option value="quarterly">كل 3 شهور</option>
+          </select>
+        </div>
+        <div class="rec-until" style="display:none;">
+          <label class="form-label small mb-1">حتى تاريخ (اختياري)</label>
+          <input type="datetime-local" class="form-control form-control-sm rec-until-input" name="media_cfg[${i}][schedules][${s}][recurrence_until]">
+        </div>
+        <div class="text-center">
+          <span class="badge bg-light text-dark" style="font-size:10px;">#${s}</span>
+        </div>`;
+      rows.appendChild(div);
     }
-    // زر فحص التوقيت (كل أوقات البطاقة)
-    box.addEventListener('click',e=>{
-        const testBtn=e.target.closest('[data-test-sched]');
-        if(!testBtn) return;
-        const times=[...box.querySelectorAll('.sch-time')].map(t=>t.value).filter(Boolean);
-        if(!times.length){ alert('لا يوجد أوقات مُدخلة بعد.'); return; }
-        const offset = parseInt(document.getElementById('tz_offset_field').value||'0',10);
-        const lines = times.map(l=>{
-            const utc=toUtcFromLocalInput(l);
-            return l+'  ==>  '+(utc?utc+' (UTC)':'خطأ');
-        });
-        alert('تحويل محلي → UTC (مع offset '+offset+' دقيقة):\n'+lines.join('\n'));
+    const minLocal = new Date(Date.now()+2*60000);
+    const minStr = minLocal.toISOString().slice(0,16);
+    rows.querySelectorAll('.sch-time').forEach(inp=>{ inp.min=minStr; attachPreview(inp); });
+    rows.querySelectorAll('.recurrence-select').forEach(sel=>{
+      sel.addEventListener('change',()=>{
+        const wrap=sel.closest('.schedule-row').querySelector('.rec-until');
+        wrap.style.display= sel.value!=='none' ? '' : 'none';
+      });
     });
+  }
+  // زر فحص التوقيت
+  box.addEventListener('click',e=>{
+    const testBtn=e.target.closest('[data-test-sched]');
+    if(!testBtn) return;
+    const times=[...box.querySelectorAll('.sch-time')].map(t=>t.value).filter(Boolean);
+    if(!times.length){ alert('لا يوجد أوقات مُدخلة بعد.'); return; }
+    const offset = parseInt(document.getElementById('tz_offset_field').value||'0',10);
+    const lines = times.map(l=>{
+      const utc=toUtcFromLocalInput(l);
+      return l+'  ==>  '+(utc?utc+' (UTC)':'خطأ');
+    });
+    alert('تحويل محلي → UTC (مع offset '+offset+' دقيقة):\n'+lines.join('\n'));
+  });
 }
 /* ==== التعليقات ==== */
 function initComments(card,i){
-    const countSel=card.querySelector('.comm-count');
-    const list=card.querySelector('#commentsList-'+i);
-    const clear=card.querySelector('.comm-clear');
-    countSel.addEventListener('change',rebuild);
-    clear.addEventListener('click',()=>{countSel.value=0;rebuild();});
-    function rebuild(){
-        const n=parseInt(countSel.value||'0',10);
-        list.innerHTML='';
-        if(n>0){
-            list.style.display='';
-            for(let k=1;k<=n;k++){
-                const d=document.createElement('div');
-                d.className='comment-item mb-2';
-                d.innerHTML=`<label class="form-label small mb-1">تعليق ${k}</label>
-                             <textarea maxlength="2200" class="form-control" name="media_cfg[${i}][comments][]" placeholder="تعليق ${k}"></textarea>`;
-                list.appendChild(d);
-            }
-        } else list.style.display='none';
-    }
+  const countSel=card.querySelector('.comm-count');
+  const list=card.querySelector('#commentsList-'+i);
+  const clear=card.querySelector('.comm-clear');
+  countSel.addEventListener('change',rebuild);
+  clear.addEventListener('click',()=>{countSel.value=0;rebuild();});
+  function rebuild(){
+    const n=parseInt(countSel.value||'0',10);
+    list.innerHTML='';
+    if(n>0){
+      list.style.display='';
+      for(let k=1;k<=n;k++){
+        const d=document.createElement('div');
+        d.className='comment-item mb-2';
+        d.innerHTML=`<label class="form-label small mb-1">تعليق ${k}</label>
+                     <textarea maxlength="2200" class="form-control" name="media_cfg[${i}][comments][]" placeholder="تعليق ${k}"></textarea>`;
+        list.appendChild(d);
+      }
+    } else list.style.display='none';
+  }
 }
 /* ==== الهاشتاج ==== */
 function initHashtags(card,i){
-    const fetchBtn=card.querySelector('.hash-fetch');
-    const addBtn=card.querySelector('.hash-add');
-    const clearBtn=card.querySelector('.hash-clear');
-    const status=card.querySelector('#hashStatus-'+i);
-    const field=card.querySelector('#hashField-'+i);
-    const list=card.querySelector('#tagsList-'+i);
-    fetchBtn.addEventListener('click',()=>{
-        status.textContent='...';
-        fetch('<?= site_url('instagram/hashtags_trend') ?>',{headers:{'X-Requested-With':'XMLHttpRequest'}})
-            .then(r=>r.json()).then(j=>{
-                if(j.status==='ok'){
-                    field.value='#'+j.tags.slice(0,10).join(' #');
-                    list.innerHTML='';
-                    j.tags.forEach(t=>{
-                        const sp=document.createElement('span');
-                        sp.textContent='#'+t;
-                        sp.onclick=()=>{
-                            const cap=card.querySelector(`textarea[name="media_cfg[${i}][caption]"]`);
-                            if(cap && !cap.value.includes('#'+t)){
-                                if(cap.value && !cap.value.endsWith(' ')) cap.value+=' ';
-                                cap.value+='#'+t;
-                                cap.dispatchEvent(new Event('input'));
-                            }
-                        };
-                        list.appendChild(sp);
-                    });
-                    list.style.display='block';
-                    status.textContent='تم جلب '+j.tags.length;
-                } else status.textContent='فشل';
-            }).catch(()=>status.textContent='خطأ');
-    });
-    addBtn.addEventListener('click',()=>{
-        if(!field.value.trim()) return;
-        const cap=card.querySelector(`textarea[name="media_cfg[${i}][caption]"]`);
-        if(cap){
-            if(cap.value && !cap.value.endsWith(' ')) cap.value+=' ';
-            cap.value+=field.value.trim();
-            cap.dispatchEvent(new Event('input'));
-        }
-    });
-    clearBtn.addEventListener('click',()=>{
-        field.value='';list.innerHTML='';list.style.display='none';status.textContent='مسح';
-    });
-    const capField=card.querySelector(`textarea[name="media_cfg[${i}][caption]"]`);
-    if(capField){
-        const counter=card.querySelector('.cap-len');
-        capField.addEventListener('input',()=>counter.textContent=capField.value.length);
+  const fetchBtn=card.querySelector('.hash-fetch');
+  const addBtn=card.querySelector('.hash-add');
+  const clearBtn=card.querySelector('.hash-clear');
+  const status=card.querySelector('#hashStatus-'+i);
+  const field=card.querySelector('#hashField-'+i);
+  const list=card.querySelector('#tagsList-'+i);
+  fetchBtn.addEventListener('click',()=>{
+    status.textContent='...';
+    fetch('<?= site_url('instagram/hashtags_trend') ?>',{headers:{'X-Requested-With':'XMLHttpRequest'}})
+      .then(r=>r.json()).then(j=>{
+        if(j.status==='ok'){
+          field.value='#'+j.tags.slice(0,10).join(' #');
+          list.innerHTML='';
+          j.tags.forEach(t=>{
+            const sp=document.createElement('span');
+            sp.textContent='#'+t;
+            sp.onclick=()=>{
+              const cap=card.querySelector(`textarea[name="media_cfg[${i}][caption]"]`);
+              if(cap && !cap.value.includes('#'+t)){
+                if(cap.value && !cap.value.endsWith(' ')) cap.value+=' ';
+                cap.value+='#'+t;
+                cap.dispatchEvent(new Event('input'));
+              }
+            };
+            list.appendChild(sp);
+          });
+          list.style.display='block';
+          status.textContent='تم جلب '+j.tags.length;
+        } else status.textContent='فشل';
+      }).catch(()=>status.textContent='خطأ');
+  });
+  addBtn.addEventListener('click',()=>{
+    if(!field.value.trim()) return;
+    const cap=card.querySelector(`textarea[name="media_cfg[${i}][caption]"]`);
+    if(cap){
+      if(cap.value && !cap.value.endsWith(' ')) cap.value+=' ';
+      cap.value+=field.value.trim();
+      cap.dispatchEvent(new Event('input'));
     }
+  });
+  clearBtn.addEventListener('click',()=>{
+    field.value='';list.innerHTML='';list.style.display='none';status.textContent='مسح';
+  });
+  const capField=card.querySelector(`textarea[name="media_cfg[${i}][caption]"]`);
+  if(capField){
+    const counter=card.querySelector('.cap-len');
+    capField.addEventListener('input',()=>counter.textContent=capField.value.length);
+  }
 }
 
 function renderFiles(){
-    filesContainer.innerHTML='';
-    filesBadge.textContent=masterFileList.length;
-    masterFileList.forEach((f,idx)=>{
-        const ext=f.name.split('.').pop().toLowerCase();
-        const isImg=['jpg','jpeg','png'].includes(ext);
-        const isVideo=ext==='mp4';
-        const card=document.createElement('div');
-        card.className='file-card';
-        card.dataset.index=idx;
-        card.innerHTML=`
-          <div class="file-head">
-            <div class="file-name" title="${f.name}">${f.name}</div>
-            <div class="file-remove" data-remove="${idx}" title="إزالة">×</div>
-          </div>
-            <div class="media-preview">
-              ${isImg?'<img src="'+URL.createObjectURL(f)+'">':(isVideo?'<video controls preload="metadata"><source src="'+URL.createObjectURL(f)+'" type="video/mp4"></video>':'<div class="small-note">لا معاينة</div>')}
-            </div>
-          <div class="tabs">
-            <div class="tab-btn active" data-tab="publish">النشر</div>
-            <div class="tab-btn" data-tab="caption">الوصف</div>
-            <div class="tab-btn" data-tab="comments">التعليقات</div>
-            <div class="tab-btn" data-tab="hashtags">هاشتاج</div>
-          </div>
-          <div class="tab-pane active" data-pane="publish">${buildPublish(idx)}</div>
-          <div class="tab-pane" data-pane="caption">${buildCaption(idx)}</div>
-          <div class="tab-pane" data-pane="comments">${buildComments(idx)}</div>
-          <div class="tab-pane" data-pane="hashtags">${buildHashtags(idx)}</div>
-        `;
-        card.querySelectorAll('.tab-btn').forEach(btn=>btn.addEventListener('click',()=>activateTab(btn)));
-        initSchedule(card,idx);
-        initComments(card,idx);
-        initHashtags(card,idx);
-        filesContainer.appendChild(card);
-    });
-    applyKindModeToAll();
-    document.querySelectorAll('[data-remove]').forEach(btn=>{
-        btn.addEventListener('click',()=>removeFile(parseInt(btn.dataset.remove)));
-    });
+  filesContainer.innerHTML='';
+  filesBadge.textContent=masterFileList.length;
+  masterFileList.forEach((f,idx)=>{
+    const ext=f.name.split('.').pop().toLowerCase();
+    const isImg=['jpg','jpeg','png'].includes(ext);
+    const isVideo=ext==='mp4';
+    const card=document.createElement('div');
+    card.className='file-card';
+    card.dataset.index=idx;
+    card.innerHTML=`
+      <div class="file-head">
+        <div class="file-name" title="${f.name}">${f.name}</div>
+        <div class="file-remove" data-remove="${idx}" title="إزالة">×</div>
+      </div>
+        <div class="media-preview">
+          ${isImg?'<img src="'+URL.createObjectURL(f)+'">':(isVideo?'<video controls preload="metadata"><source src="'+URL.createObjectURL(f)+'" type="video/mp4"></video>':'<div class="small-note">لا معاينة</div>')}
+        </div>
+      <div class="tabs">
+        <div class="tab-btn active" data-tab="publish">النشر</div>
+        <div class="tab-btn" data-tab="caption">الوصف</div>
+        <div class="tab-btn" data-tab="comments">التعليقات</div>
+        <div class="tab-btn" data-tab="hashtags">هاشتاج</div>
+      </div>
+      <div class="tab-pane active" data-pane="publish">${buildPublish(idx)}</div>
+      <div class="tab-pane" data-pane="caption">${buildCaption(idx)}</div>
+      <div class="tab-pane" data-pane="comments">${buildComments(idx)}</div>
+      <div class="tab-pane" data-pane="hashtags">${buildHashtags(idx)}</div>
+    `;
+    card.querySelectorAll('.tab-btn').forEach(btn=>btn.addEventListener('click',()=>activateTab(btn)));
+    initSchedule(card,idx);
+    initComments(card,idx);
+    initHashtags(card,idx);
+    filesContainer.appendChild(card);
+  });
+  applyKindModeToAll();
+  document.querySelectorAll('[data-remove]').forEach(btn=>{
+    btn.addEventListener('click',()=>removeFile(parseInt(btn.dataset.remove)));
+  });
 }
 function activateTab(btn){
-    const card=btn.closest('.file-card');
-    card.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
-    btn.classList.add('active');
-    const target=btn.dataset.tab;
-    card.querySelectorAll('.tab-pane').forEach(p=>p.classList.toggle('active',p.dataset.pane===target));
+  const card=btn.closest('.file-card');
+  card.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  const target=btn.dataset.tab;
+  card.querySelectorAll('.tab-pane').forEach(p=>p.classList.toggle('active',p.dataset.pane===target));
 }
 
 /* ========== تحقق الجدولة ========== */
 function validateSchedules(){
-    const now=Date.now();
-    const errors=[];
-    document.querySelectorAll('.file-card').forEach(card=>{
-        const idx=card.dataset.index;
-        const fileName = masterFileList[idx]?.name || ('#'+(idx+1));
-        const isSched = card.querySelector(`input[name="media_cfg[${idx}][publish_mode]"][value="scheduled"]`)?.checked;
-        if(!isSched) return;
-        const times=[...card.querySelectorAll('.sch-time')];
-        if(!times.length){ errors.push(`(${fileName}) لا يوجد وقت`); return; }
-        times.forEach((inp,i)=>{
-            inp.classList.remove('is-invalid');
-            if(!inp.value){ errors.push(`(${fileName}) وقت ${i+1} فارغ`); inp.classList.add('is-invalid'); return; }
-            if(!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(inp.value)){ errors.push(`(${fileName}) وقت ${i+1} تنسيق خاطئ`); inp.classList.add('is-invalid'); return; }
-            const ms = new Date(inp.value).getTime();
-            if(isNaN(ms)){ errors.push(`(${fileName}) وقت ${i+1} غير قابل للقراءة`); inp.classList.add('is-invalid'); return; }
-            if(ms - now < 30000){ errors.push(`(${fileName}) وقت ${i+1} أقل من 30 ثانية مستقبلية`); inp.classList.add('is-invalid'); return; }
-        });
+  const now=Date.now();
+  const errors=[];
+  document.querySelectorAll('.file-card').forEach(card=>{
+    const idx=card.dataset.index;
+    const fileName = masterFileList[idx]?.name || ('#'+(idx+1));
+    const isSched = card.querySelector(`input[name="media_cfg[${idx}][publish_mode]"][value="scheduled"]`)?.checked;
+    if(!isSched) return;
+    const times=[...card.querySelectorAll('.sch-time')];
+    if(!times.length){ errors.push(`(${fileName}) لا يوجد وقت`); return; }
+    times.forEach((inp,i)=>{
+      inp.classList.remove('is-invalid');
+      if(!inp.value){ errors.push(`(${fileName}) وقت ${i+1} فارغ`); inp.classList.add('is-invalid'); return; }
+      if(!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(inp.value)){ errors.push(`(${fileName}) وقت ${i+1} تنسيق خاطئ`); inp.classList.add('is-invalid'); return; }
+      const ms = new Date(inp.value).getTime();
+      if(isNaN(ms)){ errors.push(`(${fileName}) وقت ${i+1} غير قابل للقراءة`); inp.classList.add('is-invalid'); return; }
+      if(ms - now < 30000){ errors.push(`(${fileName}) وقت ${i+1} أقل من 30 ثانية مستقبلية`); inp.classList.add('is-invalid'); return; }
     });
-    return errors;
+  });
+  return errors;
 }
 
 /* ========== AJAX تنفيذ ========== */
@@ -693,112 +740,108 @@ const debugFlag=document.getElementById('debugFlag');
 const debugPill=document.getElementById('debugPill');
 
 document.addEventListener('keydown',e=>{
-    if(e.altKey && e.shiftKey && e.code==='KeyD'){
-        debugFlag.value = debugFlag.value==='1' ? '0':'1';
-        debugPill.style.display = debugFlag.value==='1' ? 'block':'none';
-        toast('Debug '+(debugFlag.value==='1'?'ON':'OFF'));
-    }
+  if(e.altKey && e.shiftKey && e.code==='KeyD'){
+    debugFlag.value = debugFlag.value==='1' ? '0':'1';
+    debugPill.style.display = debugFlag.value==='1' ? 'block':'none';
+    toast('Debug '+(debugFlag.value==='1'?'ON':'OFF'));
+  }
 });
 
 btnAjax?.addEventListener('click',()=>{
-    updatePrimaryAccount();
-    if(!primaryAccountField.value){ alert('اختر حساباً'); return; }
-    if(masterFileList.length===0){ alert('اختر ملفات'); return; }
-    const schedErrors=validateSchedules();
-    if(schedErrors.length){
-        alert('أخطاء الجدولة:\n- '+schedErrors.join('\n- '));
-        return;
+  updatePrimaryAccount();
+  if(!primaryAccountField.value){ alert('اختر حساباً'); return; }
+  if(masterFileList.length===0){ alert('اختر ملفات'); return; }
+  const schedErrors=validateSchedules();
+  if(schedErrors.length){
+    alert('أخطاء الجدولة:\n- '+schedErrors.join('\n- '));
+    return;
+  }
+  resultsLog.style.display='none';resultsLog.innerHTML='';
+  progressWrap.style.display='block';
+  uploadBar.style.width='0%';uploadBar.textContent='0%';
+  uploadStatus.textContent='بدء...';
+  btnAjax.disabled=true;
+
+  const formEl=document.getElementById('igForm');
+  const fd=new FormData();
+  [...formEl.querySelectorAll('input,select,textarea')].forEach(el=>{
+    if(!el.name) return;
+    if(el.type==='file') return;
+    if(['checkbox','radio'].includes(el.type) && !el.checked) return;
+    fd.append(el.name, el.value);
+  });
+  fd.append('_client_file_count', masterFileList.length);
+  masterFileList.forEach(f=>fd.append('media_files[]', f, f.name));
+
+  const firstTime = document.querySelector('.sch-time')?.value;
+  if(firstTime){
+    const utcPrev = toUtcFromLocalInput(firstTime);
+    console.log('[SchedulePreview]', {first_local:firstTime, calc_utc:utcPrev});
+  }
+
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST', formEl.action + (debugFlag.value==='1'?(formEl.action.includes('?')?'&':'?')+'debug=1':''), true);
+  xhr.setRequestHeader('X-Requested-With','XMLHttpRequest');
+  xhr.upload.addEventListener('progress',ev=>{
+    if(ev.lengthComputable){
+      const pc=Math.round((ev.loaded/ev.total)*100);
+      uploadBar.style.width=pc+'%';
+      uploadBar.textContent=pc+'%';
+      uploadStatus.textContent='رفع: '+pc+'%';
     }
-    resultsLog.style.display='none';resultsLog.innerHTML='';
-    progressWrap.style.display='block';
-    uploadBar.style.width='0%';uploadBar.textContent='0%';
-    uploadStatus.textContent='بدء...';
-    btnAjax.disabled=true;
-
-    const formEl=document.getElementById('igForm');
-    const fd=new FormData();
-    [...formEl.querySelectorAll('input,select,textarea')].forEach(el=>{
-        if(!el.name) return;
-        if(el.type==='file') return;
-        if(['checkbox','radio'].includes(el.type) && !el.checked) return;
-        fd.append(el.name, el.value);
-    });
-    fd.append('_client_file_count', masterFileList.length);
-    const tzOffset = parseInt(document.getElementById('tz_offset_field').value||'0',10);
-    masterFileList.forEach(f=>fd.append('media_files[]', f, f.name));
-
-    // معاينة أول وقت
-    const firstTime = document.querySelector('.sch-time')?.value;
-    if(firstTime){
-        const utcPrev = toUtcFromLocalInput(firstTime);
-        console.log('[SchedulePreview]', {first_local:firstTime, offset_minutes:tzOffset, calc_utc:utcPrev});
+  });
+  xhr.onreadystatechange=()=>{
+    if(xhr.readyState===4){
+      btnAjax.disabled=false;
+      if(xhr.status===200){
+        let j;
+        try{ j=JSON.parse(xhr.responseText); }
+        catch(e){ console.error('RAW',xhr.responseText); uploadStatus.textContent='استجابة غير صالحة'; alert('استجابة غير صالحة'); return; }
+        if(j.debug){
+          uploadStatus.textContent='DEBUG';
+          resultsLog.style.display='block';
+          resultsLog.innerHTML='<pre style="white-space:pre-wrap;direction:ltr;font-size:11px;text-align:left;">'+
+            JSON.stringify(j,null,2)+'</pre>';
+          return;
+        }
+        if(j.status==='ok'){
+          uploadStatus.textContent='انتهى';
+          showResults(j.results||[]);
+          if(j.redirect_url) setTimeout(()=>window.location.href=j.redirect_url,1300);
+        } else {
+          uploadStatus.textContent='فشل';
+          alert('فشل: '+(j.message||''));
+          showResults(j.results||[],true);
+        }
+      } else {
+        uploadStatus.textContent='HTTP '+xhr.status;
+        alert('خطأ شبكة');
+      }
     }
-
-    console.log('FD build:', masterFileList.map(f=>f.name),'_tz_offset=', tzOffset, '_tz_name=', document.getElementById('tz_name_field').value);
-
-    const xhr=new XMLHttpRequest();
-    xhr.open('POST', formEl.action + (debugFlag.value==='1'?(formEl.action.includes('?')?'&':'?')+'debug=1':''), true);
-    xhr.setRequestHeader('X-Requested-With','XMLHttpRequest');
-    xhr.upload.addEventListener('progress',ev=>{
-        if(ev.lengthComputable){
-            const pc=Math.round((ev.loaded/ev.total)*100);
-            uploadBar.style.width=pc+'%';
-            uploadBar.textContent=pc+'%';
-            uploadStatus.textContent='رفع: '+pc+'%';
-        }
-    });
-    xhr.onreadystatechange=()=>{
-        if(xhr.readyState===4){
-            btnAjax.disabled=false;
-            if(xhr.status===200){
-                let j;
-                try{ j=JSON.parse(xhr.responseText); }
-                catch(e){ console.error('RAW',xhr.responseText); uploadStatus.textContent='استجابة غير صالحة'; alert('استجابة غير صالحة'); return; }
-                if(j.debug){
-                    uploadStatus.textContent='DEBUG';
-                    resultsLog.style.display='block';
-                    resultsLog.innerHTML='<pre style="white-space:pre-wrap;direction:ltr;font-size:11px;text-align:left;">'+
-                        JSON.stringify(j,null,2)+'</pre>';
-                    return;
-                }
-                if(j.status==='ok'){
-                    uploadStatus.textContent='انتهى';
-                    showResults(j.results||[]);
-                    if(j.redirect_url) setTimeout(()=>window.location.href=j.redirect_url,1300);
-                } else {
-                    uploadStatus.textContent='فشل';
-                    alert('فشل: '+(j.message||''));
-                    showResults(j.results||[],true);
-                }
-            } else {
-                uploadStatus.textContent='HTTP '+xhr.status;
-                alert('خطأ شبكة');
-            }
-        }
-    };
-    xhr.send(fd);
+  };
+  xhr.send(fd);
 });
 
 function showResults(list, forceError=false){
-    resultsLog.style.display='block';
-    resultsLog.innerHTML='<div class="fw-bold mb-2">النتائج:</div>';
-    if(!list.length && forceError){ resultsLog.innerHTML+='<div class="err">لا تفاصيل</div>'; }
-    list.forEach(r=>{
-        if(r.status==='ok'){
-            resultsLog.innerHTML+='<div class="ok">✔ '+(r.file||'')+' '+(r.ig_user_id?('('+r.ig_user_id+')'):'')+'</div>';
-        } else if(r.status==='scheduled'){
-            resultsLog.innerHTML+='<div class="scheduled">⏱ '+(r.file||'')+' [مجدول]</div>';
-        } else {
-            resultsLog.innerHTML+='<div class="err">✖ '+(r.file||'')+' '+(r.ig_user_id?('('+r.ig_user_id+') '):'')+'('+(r.error||'خطأ')+')</div>';
-        }
-    });
+  resultsLog.style.display='block';
+  resultsLog.innerHTML='<div class="fw-bold mb-2">النتائج:</div>';
+  if(!list.length && forceError){ resultsLog.innerHTML+='<div class="err">لا تفاصيل</div>'; }
+  list.forEach(r=>{
+    if(r.status==='ok'){
+      resultsLog.innerHTML+='<div class="ok">✔ '+(r.file||'')+' '+(r.ig_user_id?('('+r.ig_user_id+')'):'')+'</div>';
+    } else if(r.status==='scheduled'){
+      resultsLog.innerHTML+='<div class="scheduled">⏱ '+(r.file||'')+' [مجدول]</div>';
+    } else {
+      resultsLog.innerHTML+='<div class="err">✖ '+(r.file||'')+' '+(r.ig_user_id?('('+r.ig_user_id+') '):'')+'('+(r.error||'خطأ')+')</div>';
+    }
+  });
 }
 
 document.getElementById('btnResetAll')?.addEventListener('click',()=>{
-    masterFileList=[]; filesInput.value=''; filesContainer.innerHTML=''; filesBadge.textContent='0';
-    document.querySelectorAll('.acc-multi').forEach(c=>{c.checked=false;c.closest('.account-item').classList.remove('selected');});
-    primaryAccountField.value=''; selCount.style.display='none';
-    progressWrap.style.display='none'; resultsLog.style.display='none'; resultsLog.innerHTML='';
+  masterFileList=[]; filesInput.value=''; filesContainer.innerHTML=''; filesBadge.textContent='0';
+  getAllBoxes().forEach(c=>c.checked=false);
+  updatePrimaryAccount();
+  progressWrap.style.display='none'; resultsLog.style.display='none'; resultsLog.innerHTML='';
 });
 document.getElementById('igForm')?.addEventListener('submit',e=>e.preventDefault());
 
