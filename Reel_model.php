@@ -620,24 +620,29 @@ class Reel_model extends CI_Model
     }
 
     /* ================= جدولة محلية ================= */
-    public function get_due_scheduled_reels($limit=40)
-    {
-        $rows=$this->db->query("
-            SELECT * FROM scheduled_reels
-            WHERE status='pending' AND processing=0
-              AND scheduled_time <= UTC_TIMESTAMP()
-            ORDER BY scheduled_time ASC
-            LIMIT ?
-        ",[$limit])->result_array();
-        if($rows){
-            $ids=array_column($rows,'id');
-            $this->db->where_in('id',$ids)->update('scheduled_reels',[
-                'processing'=>1,
-                'last_attempt_at'=>gmdate('Y-m-d H:i:s')
-            ]);
-        }
-        return $rows;
-    }
+public function get_due_scheduled_reels(int $limit = 40): array
+{
+    $now = gmdate('Y-m-d H:i:s');
+
+    $this->db->from('scheduled_reels');
+    $this->db->where('processing', 0);
+
+    // اسحب pending و scheduled وأي حالة فاضية اتسجلت بالخطأ
+    $this->db->group_start();
+        $this->db->where('status', 'pending');
+        $this->db->or_where('status', 'scheduled');
+        $this->db->or_where('status', '');
+        $this->db->or_where('status IS NULL', null, false);
+    $this->db->group_end();
+
+    // مستحق حتى الآن
+    $this->db->where('scheduled_time <=', $now);
+    $this->db->order_by('scheduled_time', 'ASC');
+    $this->db->limit(max(1,$limit));
+
+    $rows = $this->db->get()->result_array();
+    return $rows ?: [];
+}
 
 public function process_scheduled_reel($row)
 {
@@ -919,118 +924,206 @@ public function process_scheduled_reel($row)
        عند نشر / نشر مجدول نقرأ توكن الصفحة من جدول المنصة بدلاً من facebook_pages
     */
 
-    /* رفع Story Photo (فوري أو جدولة) */
-    public function upload_story_photo($user_id,$pages,$post,$files)
-    {
-        if(!self::FEATURE_STORIES) return [['type'=>'error','msg'=>'القصص معطلة']];
-        $fb_page_ids = $post['fb_page_ids'] ?? [];
-        if(empty($fb_page_ids)) return [['type'=>'error','msg'=>'اختر صفحات']];
-        if(empty($files['story_photo_file']['name']))
-            return [['type'=>'error','msg'=>'اختر صورة']];
+   /*********** Helpers للّوج والطلبات ***********/
+private function storyLog(string $label, array $ctx = []): void
+{
+    $line = $label.(empty($ctx)?'':' '.json_encode($ctx, JSON_UNESCAPED_UNICODE));
+    $this->writeLog('stories_api.log', $line);
+}
 
-        $fname=$files['story_photo_file']['name'];
-        $tmp=$files['story_photo_file']['tmp_name'];
-        $err=$files['story_photo_file']['error'];
-        if($err!==UPLOAD_ERR_OK || !is_file($tmp)) return [['type'=>'error','msg'=>'فشل رفع الصورة']];
-        $ext=strtolower(pathinfo($fname,PATHINFO_EXTENSION));
-        if(!in_array($ext,$this->story_image_exts)) return [['type'=>'error','msg'=>'امتداد غير مدعوم']];
-        if(filesize($tmp)>4*1024*1024) return [['type'=>'error','msg'=>'الحجم أكبر من 4MB']];
+private function httpHeadPublic(string $url): array
+{
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_NOBODY         => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT        => 25,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_USERAGENT      => 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+        CURLOPT_HEADER         => true,
+    ]);
+    $body = curl_exec($ch);
+    $err  = curl_error($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $finalUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+    curl_close($ch);
+    return [$code, $finalUrl, $err];
+}
 
-        $desc=trim($post['description'] ?? '');
-        $tz_offset=(int)($post['tz_offset_minutes'] ?? 0);
-        $tz_name=$post['tz_name'] ?? '';
-        $local_sched = trim($post['story_photo_schedule'] ?? '');
-        $utc_sched   = $this->localToUtc($local_sched,$tz_offset);
-        $future = $utc_sched && $this->isFutureUtc($utc_sched,60);
+// POST x-www-form-urlencoded
+private function curlPostForm(string $url, array $fields): array
+{
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => http_build_query($fields),
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_CONNECTTIMEOUT => 25,
+        CURLOPT_TIMEOUT        => 60,
+    ]);
+    $body = curl_exec($ch);
+    $err  = curl_error($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    return [$code, $body, $err];
+}
 
-        $responses=[];
-        $version=$this->graphVersion();
+// POST multipart (لازم للرفع بـ source=CURLFile)
+private function curlPostMultipart(string $url, array $fields): array
+{
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $fields,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_CONNECTTIMEOUT => 25,
+        CURLOPT_TIMEOUT        => 120,
+    ]);
+    $body = curl_exec($ch);
+    $err  = curl_error($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    return [$code, $body, $err];
+}
 
-        // جدولة: نحفظ الملف ثم ندرج في scheduled_reels
-        if($future){
-            $dir=FCPATH.'uploads/scheduled/';
-            if(!is_dir($dir)) @mkdir($dir,0775,true);
-            $safe=preg_replace('/[^a-zA-Z0-9_\-\.]/','_',$fname);
-            $stored='story_photo_sched_'.time().'_'.mt_rand(1000,9999).'_'.$safe;
-            if(!move_uploaded_file($tmp,$dir.$stored)){
-                return [['type'=>'error','msg'=>'تعذر تخزين الصورة المجدولة']];
-            }
-            $orig_local = preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/',$local_sched)
-                ? str_replace('T',' ',$local_sched).':00' : null;
-            foreach($fb_page_ids as $pid){
-                $page=$this->findPage($pages,$pid);
-                if(!$page || empty($page['page_access_token'])){
-                    $responses[]=['type'=>'error','msg'=>"توكن مفقود للصفحة $pid"]; continue;
-                }
-                $ins=[
-                    'user_id'=>$user_id,'fb_page_id'=>$pid,
-                    'video_path'=>'uploads/scheduled/'.$stored, // نستخدم نفس الحقل
-                    'description'=>$desc,'scheduled_time'=>$utc_sched,
-                    'original_local_time'=>$orig_local,
-                    'original_offset_minutes'=>$tz_offset,
-                    'original_timezone'=>$tz_name,
-                    'status'=>'pending','attempt_count'=>0,'processing'=>0,
-                    'created_at'=>gmdate('Y-m-d H:i:s')
-                ];
-                if($this->columnExists('scheduled_reels','media_type')) $ins['media_type']='story_photo';
-                if($this->columnExists('scheduled_reels','expires_at'))
-                    $ins['expires_at']=gmdate('Y-m-d H:i:s',strtotime($utc_sched)+self::STORY_EXPIRE_SECONDS);
-                $this->db->insert('scheduled_reels',$ins);
-                $responses[]=['type'=>'success','msg'=>"تمت جدولة Story Photo للصفحة $pid"];
-            }
-            return $responses;
+/*********** نشر ستوري صوري (فوري) مع لوج تفصيلي + Fallback ***********/
+public function upload_story_photo($user_id,$pagesTokens,$post,$files)
+{
+    if (!self::FEATURE_STORIES) return [['type'=>'error','msg'=>'القصص معطلة']];
+    $fb_page_ids = $post['fb_page_ids'] ?? [];
+    if (empty($fb_page_ids)) return [['type'=>'error','msg'=>'اختر صفحات']];
+    if (empty($files['story_photo_file']['name'])) return [['type'=>'error','msg'=>'اختر صورة']];
+
+    $fname = $files['story_photo_file']['name'];
+    $tmp   = $files['story_photo_file']['tmp_name'];
+    $err   = $files['story_photo_file']['error'];
+    $size  = (int)($files['story_photo_file']['size'] ?? 0);
+    $ext   = strtolower(pathinfo($fname, PATHINFO_EXTENSION));
+
+    $this->storyLog('PHOTO_ENTRY', ['name'=>$fname,'tmp'=>$tmp,'err'=>$err,'size'=>$size,'ext'=>$ext,'pages'=>count($fb_page_ids)]);
+
+    if ($err !== UPLOAD_ERR_OK || !is_file($tmp)) return [['type'=>'error','msg'=>'فشل رفع الصورة']];
+    if (!in_array($ext, $this->story_image_exts)) return [['type'=>'error','msg'=>'امتداد غير مدعوم']];
+    if ($size < 1024) return [['type'=>'error','msg'=>'ملف الصورة صغير جداً']];
+    if ($size > 10*1024*1024) return [['type'=>'error','msg'=>'الحجم أكبر من 10MB']];
+
+    // حفظ في مسار عام
+    $pubDir = FCPATH.'uploads/scheduled/';
+    if (!is_dir($pubDir)) @mkdir($pubDir, 0775, true);
+    $safe   = preg_replace('/[^a-zA-Z0-9_\-\.]/','_', $fname);
+    $stored = 'story_photo_'.time().'_'.mt_rand(1000,9999).'_'.$safe;
+    $abs    = $pubDir.$stored;
+
+    $moved = @move_uploaded_file($tmp, $abs);
+    $this->storyLog('PHOTO_MOVE', ['dest'=>$abs, 'ok'=>$moved, 'perm'=>@substr(sprintf('%o', fileperms($abs)), -4)]);
+    if (!$moved) return [['type'=>'error','msg'=>'فشل حفظ الصورة على الخادم']];
+    @chmod($abs, 0664);
+
+    // URL عام
+    $CI = &get_instance();
+    $CI->load->helper('url');
+    $publicUrl = base_url('uploads/scheduled/'.$stored);
+    [$hcode, $finalUrl, $hErr] = $this->httpHeadPublic($publicUrl);
+    $this->storyLog('PHOTO_PUBLIC_HEAD', ['url'=>$publicUrl,'http'=>$hcode,'final'=>$finalUrl,'err'=>$hErr]);
+
+    $desc       = trim($post['description'] ?? '');
+    $tz_offset  = (int)($post['tz_offset_minutes'] ?? 0);
+    $tz_name    = (string)($post['tz_name'] ?? '');
+    $version    = $this->graphVersion();
+
+    $responses = [];
+    foreach ($fb_page_ids as $pid) {
+        $page  = $this->findPage($pagesTokens, $pid);
+        $token = $page['page_access_token'] ?? '';
+        if (!$token) {
+            $responses[] = ['type'=>'error','msg'=>"توكن مفقود للصفحة $pid"];
+            $this->storyLog('PHOTO_SKIP_NO_TOKEN', ['page'=>$pid]);
+            continue;
         }
 
-        // فوري
-        foreach($fb_page_ids as $pid){
-            $page=$this->findPage($pages,$pid);
-            if(!$page || empty($page['page_access_token'])){
-                $responses[]=['type'=>'error','msg'=>"توكن مفقود للصفحة $pid"]; continue;
-            }
-            // Step 1: رفع غير منشور
-            $url="https://graph.facebook.com/{$version}/{$pid}/photos";
-            $cfile=new CURLFile($tmp,mime_content_type($tmp),$fname);
-            $payload=['published'=>'false','access_token'=>$page['page_access_token'],'source'=>$cfile];
-            $ch=curl_init($url);
-            curl_setopt_array($ch,[CURLOPT_POST=>1,CURLOPT_POSTFIELDS=>$payload,CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false]);
-            $res=curl_exec($ch); curl_close($ch);
-            $j=json_decode($res,true);
-            $this->writeLog('stories_api.log','PHOTO_UPLOAD page='.$pid.' res='.json_encode($j,JSON_UNESCAPED_UNICODE));
-            if(empty($j['id'])){
-                $responses[]=['type'=>'error','msg'=>"فشل رفع الصورة (صفحة $pid)"]; continue;
-            }
-            $photo_id=$j['id'];
-            // Step 2: نشر كقصة
-            $url2="https://graph.facebook.com/{$version}/{$pid}/photo_stories";
-            $ch2=curl_init($url2);
-            curl_setopt_array($ch2,[CURLOPT_POST=>1,CURLOPT_POSTFIELDS=>http_build_query([
-                'photo_id'=>$photo_id,'access_token'=>$page['page_access_token']
-            ]),CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false]);
-            $res2=curl_exec($ch2); curl_close($ch2);
-            $j2=json_decode($res2,true);
-            $this->writeLog('stories_api.log','PHOTO_STORY_FINISH page='.$pid.' res='.json_encode($j2,JSON_UNESCAPED_UNICODE));
-            if(empty($j2['success'])){
-                $responses[]=['type'=>'error','msg'=>"فشل نشر القصة (صفحة $pid)"]; continue;
-            }
-            $post_id=$j2['post_id'] ?? null;
+        // 1) جرّب رفع بالـ URL أولاً
+        $url1 = "https://graph.facebook.com/{$version}/{$pid}/photos";
+        $payloadUrl = [
+            'published'    => 'false',
+            'url'          => $publicUrl,
+            'caption'      => $desc,
+            'access_token' => $token
+        ];
+        [$code1, $body1, $err1] = $this->curlPostForm($url1, $payloadUrl);
+        $j1 = @json_decode($body1, true);
+        $this->storyLog('PHOTO_UPLOAD_URL', ['page'=>$pid,'http'=>$code1,'curl_err'=>$err1,'resp'=>$j1]);
 
-            $insertData=[
-                'user_id'=>$user_id,'fb_page_id'=>$pid,'video_id'=>NULL,
-                'file_name'=>$fname,'file_path'=>NULL,'cover_path'=>NULL,'cover_source'=>NULL,
-                'description'=>$desc,'scheduled_at'=>NULL,'original_local_time'=>NULL,
-                'original_offset_minutes'=>$tz_offset,'original_timezone'=>$tz_name,
-                'status'=>'published','created_at'=>gmdate('Y-m-d H:i:s')
+        $photo_id = $j1['id'] ?? null;
+
+        // 2) لو فشل رفع URL، اعمل Fallback رفع ملف مباشرة (source)
+        if (!$photo_id) {
+            $cfile = new CURLFile($abs, mime_content_type($abs) ?: 'image/jpeg', basename($abs));
+            $payloadSrc = [
+                'published'    => 'false',
+                'source'       => $cfile,
+                'caption'      => $desc,
+                'access_token' => $token
             ];
-            if($this->columnExists('reels','media_type')) $insertData['media_type']='story_photo';
-            if($this->columnExists('reels','post_id')) $insertData['post_id']=$post_id;
-            if($this->columnExists('reels','expires_at')) $insertData['expires_at']=gmdate('Y-m-d H:i:s',time()+self::STORY_EXPIRE_SECONDS);
-            $this->db->insert('reels',$insertData);
-
-            $responses[]=['type'=>'success','msg'=>"تم نشر Story Photo على الصفحة $pid"];
+            [$code1b, $body1b, $err1b] = $this->curlPostMultipart($url1, $payloadSrc);
+            $j1b = @json_decode($body1b, true);
+            $this->storyLog('PHOTO_UPLOAD_SOURCE', ['page'=>$pid,'http'=>$code1b,'curl_err'=>$err1b,'resp'=>$j1b]);
+            $photo_id = $j1b['id'] ?? null;
         }
-        return $responses;
+
+        if (!$photo_id) {
+            $msg = 'فشل رفع الصورة (تحقّق من وصول فيسبوك للصورة عبر HTTPS أو جرّب صورة أصغر/امتداد مختلف).';
+            if (!empty($j1['error']['message'])) $msg .= ' - '.$j1['error']['message'];
+            $responses[] = ['type'=>'error','msg'=>"{$msg} (صفحة $pid)"];
+            continue;
+        }
+
+        // 3) نشر كقصة
+        $url2 = "https://graph.facebook.com/{$version}/{$pid}/photo_stories";
+        [$code2, $body2, $err2] = $this->curlPostForm($url2, [
+            'photo_id'     => $photo_id,
+            'access_token' => $token
+        ]);
+        $j2 = @json_decode($body2, true);
+        $this->storyLog('PHOTO_STORY_PUBLISH', ['page'=>$pid,'http'=>$code2,'curl_err'=>$err2,'resp'=>$j2]);
+
+        if ($code2 < 200 || $code2 >= 300 || empty($j2['success'])) {
+            $msg = 'فشل نشر القصة';
+            if (!empty($j2['error']['message'])) $msg .= ' - '.$j2['error']['message'];
+            $responses[] = ['type'=>'error','msg'=>"$msg (صفحة $pid)"];
+            continue;
+        }
+
+        // 4) سجل النجاح
+        $ins = [
+            'user_id'                 => $user_id,
+            'fb_page_id'              => $pid,
+            'video_id'                => NULL,
+            'file_name'               => $fname,
+            'file_path'               => 'uploads/scheduled/'.$stored,
+            'cover_path'              => NULL,
+            'cover_source'            => NULL,
+            'description'             => $desc,
+            'scheduled_at'            => NULL,
+            'original_local_time'     => NULL,
+            'original_offset_minutes' => $tz_offset,
+            'original_timezone'       => $tz_name,
+            'status'                  => 'published',
+            'created_at'              => gmdate('Y-m-d H:i:s')
+        ];
+        if ($this->columnExists('reels','media_type')) $ins['media_type']='story_photo';
+        if ($this->columnExists('reels','post_id'))    $ins['post_id']=$j2['post_id'] ?? null;
+        if ($this->columnExists('reels','expires_at')) $ins['expires_at']=gmdate('Y-m-d H:i:s', time()+self::STORY_EXPIRE_SECONDS);
+
+        $this->db->insert('reels', $ins);
+        $responses[] = ['type'=>'success','msg'=>"تم نشر ستوري الصورة على صفحة $pid"];
     }
 
+    return $responses;
+}
     /* رفع Story Video (نفس السابق) */
     public function upload_story_video($user_id,$pages,$post,$files)
     {
@@ -1252,68 +1345,99 @@ public function process_scheduled_reel($row)
     }
 
     /* نشر Story Photo مجدول */
-    public function publish_scheduled_story_photo($row)
-    {
-        if(!self::FEATURE_STORIES){ $this->failScheduled($row,$row['attempt_count']+1,'Stories disabled'); return; }
+   public function publish_scheduled_story_photo($row)
+{
+    if (!self::FEATURE_STORIES) { $this->failScheduled($row, $row['attempt_count']+1, 'Stories disabled'); return; }
 
-        // اقرأ بيانات الصفحة من جدول المنصة
-        $page=$this->db->get_where('facebook_rx_fb_page_info',[
-            'page_id'=>$row['fb_page_id'],
-            'user_id'=>$row['user_id']
-        ])->row_array();
+    $page = $this->db->get_where('facebook_rx_fb_page_info',[
+        'page_id'=>$row['fb_page_id'],
+        'user_id'=>$row['user_id']
+    ])->row_array();
 
-        $attempt=$row['attempt_count']+1;
-        $this->db->where('id',$row['id'])->update('scheduled_reels',[
-            'attempt_count'=>$attempt,'last_attempt_at'=>gmdate('Y-m-d H:i:s')
-        ]);
-        $abs=FCPATH.$row['video_path']; // الصورة
-        if(!is_file($abs) || !$page || empty($page['page_access_token'])){
-            $this->failScheduled($row,$attempt,'ملف/توكن مفقود'); return;
-        }
-        $version=$this->graphVersion();
+    $attempt = $row['attempt_count']+1;
+    $this->db->where('id',$row['id'])->update('scheduled_reels',[
+        'attempt_count'=>$attempt,'last_attempt_at'=>gmdate('Y-m-d H:i:s')
+    ]);
 
-        // رفع الصورة unpublished
-        $url="https://graph.facebook.com/{$version}/{$row['fb_page_id']}/photos";
-        $cfile=new CURLFile($abs,mime_content_type($abs),basename($abs));
-        $payload=['published'=>'false','access_token'=>$page['page_access_token'],'source'=>$cfile];
-        $ch=curl_init($url);
-        curl_setopt_array($ch,[CURLOPT_POST=>1,CURLOPT_POSTFIELDS=>$payload,CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false]);
-        $res=curl_exec($ch); curl_close($ch);
-        $j=json_decode($res,true);
-        $this->writeLog('stories_api.log','PHOTO_SCHED_UPLOAD id='.$row['id'].' res='.json_encode($j,JSON_UNESCAPED_UNICODE));
-        if(empty($j['id'])){ $this->failScheduled($row,$attempt,'فشل رفع الصورة'); return; }
-        $photo_id=$j['id'];
-
-        // نشر story
-        $url2="https://graph.facebook.com/{$version}/{$row['fb_page_id']}/photo_stories";
-        $ch2=curl_init($url2);
-        curl_setopt_array($ch2,[CURLOPT_POST=>1,CURLOPT_POSTFIELDS=>http_build_query([
-            'photo_id'=>$photo_id,'access_token'=>$page['page_access_token']
-        ]),CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false]);
-        $res2=curl_exec($ch2); curl_close($ch2);
-        $j2=json_decode($res2,true);
-        $this->writeLog('stories_api.log','PHOTO_SCHED_PUBLISH id='.$row['id'].' res='.json_encode($j2,JSON_UNESCAPED_UNICODE));
-        if(empty($j2['success'])){ $this->failScheduled($row,$attempt,'فشل نشر القصة'); return; }
-        $post_id=$j2['post_id'] ?? null;
-
-        $this->db->where('id',$row['id'])->update('scheduled_reels',[
-            'status'=>'uploaded','fb_response'=>$photo_id,'published_time'=>gmdate('Y-m-d H:i:s'),
-            'processing'=>0,'last_error'=>NULL
-        ]);
-
-        $ins=[
-            'user_id'=>$row['user_id'],'fb_page_id'=>$row['fb_page_id'],'video_id'=>NULL,
-            'file_name'=>basename($row['video_path']),'file_path'=>$row['video_path'],
-            'cover_path'=>NULL,'cover_source'=>NULL,
-            'description'=>$row['description'],'scheduled_at'=>$row['scheduled_time'],
-            'original_local_time'=>$row['original_local_time'],'original_offset_minutes'=>$row['original_offset_minutes'],
-            'original_timezone'=>$row['original_timezone'],'status'=>'published',
-            'created_at'=>gmdate('Y-m-d H:i:s')
-        ];
-        if($this->columnExists('reels','media_type')) $ins['media_type']='story_photo';
-        if($this->columnExists('reels','post_id')) $ins['post_id']=$post_id;
-        if($this->columnExists('reels','expires_at')) $ins['expires_at']=gmdate('Y-m-d H:i:s',time()+self::STORY_EXPIRE_SECONDS);
-        $this->db->insert('reels',$ins);
-        $this->logSched($row,$attempt,'success','Story photo published');
+    $absPath = FCPATH . ltrim((string)$row['video_path'],'/');
+    if (!is_file($absPath) || !$page || empty($page['page_access_token'])) {
+        $this->failScheduled($row, $attempt, 'ملف/توكن مفقود'); return;
     }
+
+    $CI=&get_instance(); $CI->load->helper('url');
+    $publicUrl = base_url(ltrim((string)$row['video_path'],'/'));
+    [$hcode, $finalUrl, $hErr] = $this->httpHeadPublic($publicUrl);
+    $this->storyLog('PHOTO_SCHED_HEAD', ['id'=>$row['id'],'url'=>$publicUrl,'http'=>$hcode,'final'=>$finalUrl,'err'=>$hErr]);
+
+    $version = $this->graphVersion();
+    $desc    = (string)($row['description'] ?? '');
+    $pid     = (string)$row['fb_page_id'];
+    $token   = $page['page_access_token'];
+
+    // 1) جرّب بالـ URL أولاً
+    $url1 = "https://graph.facebook.com/{$version}/{$pid}/photos";
+    $payloadUrl = [
+        'published'    => 'false',
+        'url'          => $publicUrl,
+        'caption'      => $desc,
+        'access_token' => $token
+    ];
+    [$code1, $body1, $err1] = $this->curlPostForm($url1, $payloadUrl);
+    $j1 = @json_decode($body1,true);
+    $this->storyLog('PHOTO_SCHED_UPLOAD_URL', ['id'=>$row['id'],'http'=>$code1,'curl_err'=>$err1,'resp'=>$j1]);
+    $photo_id = $j1['id'] ?? null;
+
+    // 2) لو فشل، جرّب رفع الملف مباشرة
+    if (!$photo_id) {
+        $cfile = new CURLFile($absPath, mime_content_type($absPath) ?: 'image/jpeg', basename($absPath));
+        $payloadSrc = [
+            'published'    => 'false',
+            'source'       => $cfile,
+            'caption'      => $desc,
+            'access_token' => $token
+        ];
+        [$code1b, $body1b, $err1b] = $this->curlPostMultipart($url1, $payloadSrc);
+        $j1b = @json_decode($body1b,true);
+        $this->storyLog('PHOTO_SCHED_UPLOAD_SOURCE', ['id'=>$row['id'],'http'=>$code1b,'curl_err'=>$err1b,'resp'=>$j1b]);
+        $photo_id = $j1b['id'] ?? null;
+    }
+
+    if (!$photo_id) { $this->failScheduled($row, $attempt, 'فشل رفع الصورة'); return; }
+
+    // 3) نشر story
+    $url2 = "https://graph.facebook.com/{$version}/{$pid}/photo_stories";
+    [$code2, $body2, $err2] = $this->curlPostForm($url2, [
+        'photo_id'     => $photo_id,
+        'access_token' => $token
+    ]);
+    $j2 = @json_decode($body2,true);
+    $this->storyLog('PHOTO_SCHED_PUBLISH', ['id'=>$row['id'],'http'=>$code2,'curl_err'=>$err2,'resp'=>$j2]);
+
+    if ($code2 < 200 || $code2 >= 300 || empty($j2['success'])) {
+        $this->failScheduled($row, $attempt, !empty($j2['error']['message'])?$j2['error']['message']:'فشل نشر القصة');
+        return;
+    }
+
+    // 4) تحديث الجداول
+    $this->db->where('id',$row['id'])->update('scheduled_reels',[
+        'status'=>'uploaded','fb_response'=>$photo_id,'published_time'=>gmdate('Y-m-d H:i:s'),
+        'processing'=>0,'last_error'=>NULL
+    ]);
+
+    $ins=[
+        'user_id'=>$row['user_id'],'fb_page_id'=>$row['fb_page_id'],'video_id'=>NULL,
+        'file_name'=>basename((string)$row['video_path']),'file_path'=>$row['video_path'],
+        'cover_path'=>NULL,'cover_source'=>NULL,
+        'description'=>$desc,'scheduled_at'=>$row['scheduled_time'],
+        'original_local_time'=>$row['original_local_time'],'original_offset_minutes'=>$row['original_offset_minutes'],
+        'original_timezone'=>$row['original_timezone'],'status'=>'published',
+        'created_at'=>gmdate('Y-m-d H:i:s')
+    ];
+    if ($this->columnExists('reels','media_type')) $ins['media_type']='story_photo';
+    if ($this->columnExists('reels','post_id'))    $ins['post_id']=$j2['post_id'] ?? null;
+    if ($this->columnExists('reels','expires_at')) $ins['expires_at']=gmdate('Y-m-d H:i:s', time()+self::STORY_EXPIRE_SECONDS);
+
+    $this->db->insert('reels',$ins);
+    $this->logSched($row,$attempt,'success','Story photo published');
+   }
 }
