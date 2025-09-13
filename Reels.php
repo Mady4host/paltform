@@ -17,7 +17,7 @@ class Reels extends CI_Controller
     const MIN_FUTURE_SECONDS     = 30;
     const ALLOWED_EXTENSIONS     = ['mp4','mov','mkv','m4v'];
     const MIN_FILE_SIZE_BYTES    = 50*1024;
-    const MAX_SCHEDULE_FILES     = 40;
+    const MAX_SCHEDULE_FILES     = 200;
     const DEBUG_LOG              = true;
     const FEATURE_STORIES        = true;
     const IMAGE_FALLBACK_QUERY_TOKEN = true; // إضافة التوكن للصورة لو متاح
