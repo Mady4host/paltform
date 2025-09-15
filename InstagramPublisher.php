@@ -2,12 +2,7 @@
 defined('BASEPATH') OR exit('No direct script access allowed');
 
 /**
- * InstagramPublisher (v1.2)
- * - يدعم نشر Reel (Video)
- * - يدعم نشر Story (Image / Video) باستخدام media_type=STORIES مع Fallback is_story=true
- * - Poll لحالة المعالجة حتى FINISHED قبل media_publish
- * - Logging تفصيلي
- * - فحص وصول URL الملف قبل الإرسال
+ * InstagramPublisher (v1.3) - fixed: do not call media_publish on poll timeout
  */
 class InstagramPublisher {
 
@@ -41,7 +36,9 @@ class InstagramPublisher {
 
         $poll = $this->pollProcessing($create['creation_id'], $accessToken, $igUserId);
         if(!$poll['ok']) {
-            return $this->fail('processing_not_finished', $poll);
+            // processing did not finish within our short window — return creation_id so cron can continue later
+            $this->log("REEL_PROCESSING_TIMEOUT creation_id={$create['creation_id']}");
+            return ['ok'=>true,'creation_id'=>$create['creation_id'],'processing'=>true];
         }
 
         $publish = $this->publishContainer($igUserId, $create['creation_id'], $accessToken);
@@ -69,10 +66,11 @@ class InstagramPublisher {
         $create = $this->createStoryContainer($igUserId, $publicUrl, $fileType, $accessToken);
         if(!$create['ok']) return $create;
 
-        // عادةً ال Stories سريعة، لكن نعمل Poll خفيف
+        // Poll; if not finished return creation_id and processing flag (do NOT call publish on timeout)
         $poll = $this->pollProcessing($create['creation_id'], $accessToken, $igUserId, true);
         if(!$poll['ok']) {
             $this->log("STORY_PROCESSING_TIMEOUT creation_id={$create['creation_id']}");
+            return ['ok'=>true,'creation_id'=>$create['creation_id'],'processing'=>true];
         }
 
         $publish = $this->publishContainer($igUserId, $create['creation_id'], $accessToken);
@@ -103,13 +101,7 @@ class InstagramPublisher {
         return ['ok'=>true,'creation_id'=>$res['id']];
     }
 
-    /**
-     * Story container:
-     * المحاولة الأولى: media_type=STORIES
-     * Fallback: is_story=true (لبعض الإصدارات القديمة)
-     */
     public function createStoryContainer($igUserId, $url, $fileType, $token) {
-        // Attempt #1
         $params = [
             'media_type' => 'STORIES'
         ];
