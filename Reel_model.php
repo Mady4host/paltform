@@ -181,7 +181,7 @@ class Reel_model extends CI_Model
     }
     private function getVideoStatus($video_id,$access_token)
     {
-        $url="https://graph.facebook.com/v23.0/{$video_id}?fields=status&access_token=".urlencode($access_token);
+        $url="https://graph.facebook.com/v18.0/{$video_id}?fields=status&access_token=".urlencode($access_token);
         $ch=curl_init($url);
         curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false]);
         $res=curl_exec($ch); curl_close($ch);
@@ -612,7 +612,7 @@ class Reel_model extends CI_Model
     }
     private function post_comment_now($video_id,$access_token,$message)
     {
-        $url="https://graph.facebook.com/v23.0/{$video_id}/comments";
+        $url="https://graph.facebook.com/v18.0/{$video_id}/comments";
         $ch=curl_init($url);
         curl_setopt_array($ch,[CURLOPT_POST=>1,CURLOPT_POSTFIELDS=>http_build_query(['access_token'=>$access_token,'message'=>$message]),CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false]);
         $r=curl_exec($ch); curl_close($ch);
