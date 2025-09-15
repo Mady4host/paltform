@@ -1104,7 +1104,7 @@ private function scheduleBatch(
         $acctoken = $row['page_access_token'];
         if(!$acctoken) return false;
 
-        $url = "https://graph.facebook.com/v23.0/".$fb_page_id."?fields=id,name,picture&access_token=".urlencode($acctoken);
+        $url = "https://graph.facebook.com/v18.0/".$fb_page_id."?fields=id,name,picture&access_token=".urlencode($acctoken);
         $resp = @file_get_contents($url);
         if($resp===false) return false;
         $j = json_decode($resp,true);
