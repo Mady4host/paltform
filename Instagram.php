@@ -5,8 +5,9 @@ defined('BASEPATH') OR exit('No direct script access allowed');
  * Instagram Controller (UTC Scheduling)
  * - الأوقات مخزنة UTC
  * - حفظ original_local_time / original_offset_minutes / original_timezone
+ * - يعتمد بالكامل على جدول المنصّة facebook_rx_fb_page_info لمصادر حسابات إنستجرام
+ * - يحافظ على نفس مفاتيح البيانات للواجهات (ig_user_id, ig_username, ig_profile_picture, page_name, access_token)
  */
-
 class Instagram extends CI_Controller
 {
     private const MAIN_SESSION_USER_KEY = 'user_id';
@@ -39,7 +40,12 @@ class Instagram extends CI_Controller
     }
 
     /*********** TIME HELPERS ***********/
-    private function localToUtc(?string $local,int $offsetMinutes){
+    /**
+     * Convert local time string (format Y-m-dTH:i) and offsetMinutes to UTC timestamp string.
+     * Note: offsetMinutes is minutes to add to UTC to get local (i.e., local = UTC + offset).
+     * Therefore UTC = local - offset.
+     */
+        private function localToUtc(?string $local,int $offsetMinutes){
         if(!$local) return null;
         $local=trim($local);
         if(!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/',$local)) return null;
@@ -47,46 +53,208 @@ class Instagram extends CI_Controller
         if($ts===false) return null;
         return gmdate('Y-m-d H:i:s', $ts + ($offsetMinutes*60));
     }
+
     private function isFutureUtc(?string $utc,$min=self::MIN_FUTURE_SECONDS){
         if(!$utc) return false;
-        $ts=strtotime($utc);
-        return $ts!==false && $ts > time()+$min;
+        try {
+            $dt = new DateTimeImmutable($utc, new DateTimeZone('UTC'));
+            $now = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+            return ($dt->getTimestamp() > $now->getTimestamp() + (int)$min);
+        } catch (Exception $e) {
+            return false;
+        }
     }
 
-    private function syncInstagramAccounts($user_id){
-        $sql="INSERT INTO instagram_accounts
-                (user_id, ig_user_id, ig_username, ig_profile_picture, page_id, page_name, access_token, ig_linked, created_at, updated_at)
-              SELECT fp.user_id, fp.ig_user_id, fp.ig_username, fp.ig_profile_picture,
-                     fp.fb_page_id, fp.page_name, fp.page_access_token, fp.ig_linked, NOW(), NOW()
-              FROM facebook_pages fp
-              WHERE fp.user_id=?
-                AND fp.ig_linked=1
-                AND fp.ig_user_id IS NOT NULL
-              ON DUPLICATE KEY UPDATE
-                ig_username=VALUES(ig_username),
-                ig_profile_picture=COALESCE(NULLIF(VALUES(ig_profile_picture),''), instagram_accounts.ig_profile_picture),
-                page_id=VALUES(page_id),
-                page_name=VALUES(page_name),
-                access_token=VALUES(access_token),
-                ig_linked=VALUES(ig_linked),
-                updated_at=NOW()";
-        $this->db->query($sql,[$user_id]);
+    /*********** HTTP REQUEST WITH RETRY (CURL) ***********/
+    private function httpRequestWithRetry(string $method, string $url, array $opts = [], int $maxAttempts = 3, int $initialDelayMs = 500) {
+        $attempt = 0;
+        $delay = max(100, (int)$initialDelayMs);
+        $method = strtoupper($method);
+        while ($attempt < $maxAttempts) {
+            $attempt++;
+            $ch = curl_init();
+            $headers = $opts['headers'] ?? [];
+            curl_setopt($ch, CURLOPT_URL, $url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_HEADER, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, isset($opts['timeout']) ? (int)$opts['timeout'] : 30);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+            if ($method === 'POST') {
+                curl_setopt($ch, CURLOPT_POST, true);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $opts['post_fields'] ?? []);
+            }
+            if (!empty($headers) && is_array($headers)) {
+                curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+            }
+            $raw = curl_exec($ch);
+            $err = curl_error($ch);
+            $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $header_size = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+            $header_text = $header_size ? substr((string)$raw, 0, $header_size) : '';
+            $body = $header_size ? substr((string)$raw, $header_size) : (string)$raw;
+            curl_close($ch);
+
+            // parse headers (last response block)
+            $hdrs = [];
+            if ($header_text) {
+                $lines = preg_split("/\r\n|\n|\r/", $header_text);
+                foreach ($lines as $line) {
+                    if (strpos($line, ':') !== false) {
+                        [$k,$v] = explode(':', $line, 2);
+                        $hdrs[strtolower(trim($k))] = trim($v);
+                    }
+                }
+            }
+
+            if ($err) {
+                if ($attempt < $maxAttempts) {
+                    usleep($delay * 1000);
+                    $delay = min(60000, (int)($delay * 1.8));
+                    continue;
+                }
+                return ['ok'=>false,'error'=>'curl_error','curl_error'=>$err,'http_code'=>$code,'headers'=>$hdrs,'body'=>$body];
+            }
+
+            // Treat 429 and server 5xx as transient
+            if (in_array($code, [429,500,502,503,504], true) && $attempt < $maxAttempts) {
+                usleep($delay * 1000);
+                $delay = min(60000, (int)($delay * 1.8));
+                continue;
+            }
+
+            return ['ok'=>true,'http_code'=>$code,'headers'=>$hdrs,'body'=>$body];
+        }
+
+        return ['ok'=>false,'error'=>'max_attempts_reached'];
+    }
+
+    /*********** PLATFORM TABLE HELPERS (facebook_rx_fb_page_info) ***********/
+    private function getPlatformAccounts(int $user_id, bool $requireLinked = false): array {
+        if(!$this->db->table_exists('facebook_rx_fb_page_info')) return [];
+
+        $this->db->select("
+            user_id,
+            instagram_business_account_id AS ig_user_id,
+            insta_username AS ig_username,
+            ig_profile_picture,
+            page_id,
+            COALESCE(page_name, username, page_id) AS page_name,
+            page_access_token,
+            ig_linked,
+            has_instagram
+        ", false)
+        ->from('facebook_rx_fb_page_info')
+        ->where('user_id', $user_id)
+        ->where('has_instagram', '1')
+        ->where("(instagram_business_account_id <> '')", null, false);
+
+        if ($requireLinked) {
+            $this->db->where('ig_linked', 1);
+        }
+
+        $this->db->order_by('COALESCE(page_name, username, page_id)', 'ASC', false);
+
+        $rows = $this->db->get()->result_array();
+
+        $out=[];
+        foreach($rows as $r){
+            $pic = (string)($r['ig_profile_picture'] ?? '');
+
+            // إذا ما فيها صورة، جرب نحصلها لكن بهدوء لتجنب انفلات الطلبات
+            if ($pic === '' && !empty($r['ig_user_id']) && !empty($r['page_access_token'])) {
+                usleep(100000); // throttle
+                $fetched = $this->fetchIgProfilePicture($r['ig_user_id'], $r['page_access_token']);
+                if ($fetched !== '') {
+                    $pic = $fetched;
+                    $this->db->where('user_id', $user_id)
+                             ->where('page_id', $r['page_id'])
+                             ->update('facebook_rx_fb_page_info', ['ig_profile_picture' => $pic]);
+                }
+            }
+
+            $out[]=[
+                'id'                 => (string)($r['page_id'] ?? ''),
+                'user_id'            => (int)$r['user_id'],
+                'ig_user_id'         => (string)($r['ig_user_id']),
+                'ig_username'        => (string)($r['ig_username'] ?? ''),
+                'ig_profile_picture' => $pic,
+                'page_name'          => (string)($r['page_name'] ?? ''),
+                'access_token'       => (string)($r['page_access_token'] ?? ''),
+                'ig_linked'          => (int)$r['ig_linked'],
+            ];
+        }
+        return $out;
+    }
+
+    private function getPlatformAccountByIgUserId(int $user_id, string $ig_user_id, bool $requireLinked = false): ?array {
+        if(!$this->db->table_exists('facebook_rx_fb_page_info')) return null;
+
+        $this->db->select("
+            user_id,
+            instagram_business_account_id AS ig_user_id,
+            insta_username AS ig_username,
+            ig_profile_picture,
+            page_id,
+            COALESCE(page_name, username, page_id) AS page_name,
+            page_access_token,
+            ig_linked,
+            has_instagram
+        ", false)
+        ->from('facebook_rx_fb_page_info')
+        ->where('user_id', $user_id)
+        ->where('has_instagram', '1')
+        ->where('instagram_business_account_id', $ig_user_id);
+
+        if ($requireLinked) {
+            $this->db->where('ig_linked', 1);
+        }
+
+        $row = $this->db->limit(1)->get()->row_array();
+        if(!$row) return null;
+
+        if (empty($row['ig_profile_picture']) && !empty($row['ig_user_id']) && !empty($row['page_access_token'])) {
+            usleep(100000);
+            $fetched = $this->fetchIgProfilePicture($row['ig_user_id'], $row['page_access_token']);
+            if ($fetched !== '') {
+                $row['ig_profile_picture'] = $fetched;
+                $this->db->where('user_id', $user_id)
+                         ->where('instagram_business_account_id', $ig_user_id)
+                         ->update('facebook_rx_fb_page_info', ['ig_profile_picture' => $fetched]);
+            }
+        }
+
+        return $row;
+    }
+
+    private function fetchIgProfilePicture(string $ig_user_id, string $accessToken): string {
+        if($ig_user_id === '' || $accessToken === '') return '';
+        $apiVersion = 'v19.0';
+        $url = 'https://graph.facebook.com/'.$apiVersion.'/'.rawurlencode($ig_user_id).'?fields=profile_picture_url&access_token='.rawurlencode($accessToken);
+
+        $res = $this->httpRequestWithRetry('GET', $url, [], 3, 500);
+        if(!$res['ok']){
+            @file_put_contents(APPPATH.'logs/ig_fetch_profile_pic.log',"[".gmdate('Y-m-d H:i:s')."] fetch_error ig={$ig_user_id} err=".json_encode($res)."\n", FILE_APPEND);
+            return '';
+        }
+
+        $code = $res['http_code'] ?? 0;
+        $body = $res['body'] ?? '';
+        $hdrs = $res['headers'] ?? [];
+
+        if(!empty($hdrs['x-app-usage'])){
+            @file_put_contents(APPPATH.'logs/ig_fetch_profile_pic.log',"[".gmdate('Y-m-d H:i:s')."] x-app-usage={$hdrs['x-app-usage']} for ig={$ig_user_id}\n", FILE_APPEND);
+        }
+
+        $data = json_decode($body, true);
+        if($code===200 && is_array($data) && !empty($data['profile_picture_url'])){
+            return (string)$data['profile_picture_url'];
+        }
+        return '';
     }
 
     public function upload(){
         $user_id=$this->requireLogin();
-        $cnt=$this->db->from('instagram_accounts')
-                      ->where('user_id',$user_id)
-                      ->where('ig_linked',1)
-                      ->where('status','active')->count_all_results();
-        if($cnt==0){ $this->syncInstagramAccounts($user_id); }
-        $accounts=$this->db->select('id,user_id,ig_user_id,ig_username,ig_profile_picture,page_name,access_token')
-                           ->from('instagram_accounts')
-                           ->where('user_id',$user_id)
-                           ->where('ig_linked',1)
-                           ->where('ig_user_id IS NOT NULL',null,false)
-                           ->where('status','active')
-                           ->order_by('page_name','ASC')->get()->result_array();
+        $accounts = $this->getPlatformAccounts($user_id, false);
         $this->load->view('instagram_upload',['accounts'=>$accounts]);
     }
 
@@ -149,13 +317,13 @@ class Instagram extends CI_Controller
         $globalResults=[];
         $firstRedirect=null;
 
-        // ========== FACEBOOK-COMPAT SCHEDULER (مطابق لمنطق فيسبوك) ==========
+        // ========== FACEBOOK-COMPAT SCHEDULER ==========
         if (isset($_POST['schedule_times_fb']) && is_array($_POST['schedule_times_fb'])) {
             $tzOffsetMinFb = (int)($this->input->post('tz_offset_minutes') ?? 0);
-            $schedLocalArr = $_POST['schedule_times_fb'];             // YYYY-MM-DDTHH:MM لكل ملف
-            $descsFb       = $_POST['descriptions_fb'] ?? [];         // أوصاف لكل ملف (اختياري)
-            $commentsFb    = $_POST['comments_fb'] ?? [];             // comments_fb[INDEX][] (اختياري)
-            $global_desc   = trim((string)$this->input->post('description_fb')); // وصف عام (اختياري)
+            $schedLocalArr = $_POST['schedule_times_fb'];
+            $descsFb       = $_POST['descriptions_fb'] ?? [];
+            $commentsFb    = $_POST['comments_fb'] ?? [];
+            $global_desc   = trim((string)$this->input->post('description_fb'));
 
             $scheduledFiles = [];
             $immediateFiles = [];
@@ -173,7 +341,7 @@ class Instagram extends CI_Controller
                 $f   = $files[$i];
                 $ext = strtolower(pathinfo($f['name'], PATHINFO_EXTENSION));
                 $isVideo = ($ext === 'mp4');
-                if (!$isVideo) { continue; } // ريلز فقط كما في فيسبوك
+                if (!$isVideo) { continue; }
 
                 $saveMeta = $this->saveUploadedFile($f, $user_id);
                 if (!$saveMeta['ok']) {
@@ -228,7 +396,7 @@ class Instagram extends CI_Controller
             if (!empty($scheduledFiles)) {
                 $indicesDone = array_column($scheduledFiles, 0);
                 foreach ($indicesDone as $di) {
-                    $files[$di]['error'] = UPLOAD_ERR_NO_FILE; // منع إعادة المعالجة في اللوب الأصلي
+                    $files[$di]['error'] = UPLOAD_ERR_NO_FILE;
                 }
             }
         }
@@ -369,16 +537,12 @@ class Instagram extends CI_Controller
 
             // نشر فوري
             foreach($accounts as $ig_uid){
-                $account=$this->db->select('*')->from('instagram_accounts')
-                                  ->where('user_id',$user_id)
-                                  ->where('ig_user_id',$ig_uid)
-                                  ->where('ig_linked',1)
-                                  ->where('status','active')->get()->row_array();
+                $account = $this->getPlatformAccountByIgUserId($user_id, $ig_uid, false);
                 if(!$account){
                     $globalResults[]=['file'=>$fileArr['name'],'ig_user_id'=>$ig_uid,'status'=>'error','error'=>'account_not_found'];
                     continue;
                 }
-                $token=$account['access_token'] ?? $this->session->userdata('fb_access_token');
+                $token = $account['page_access_token'] ?? $this->session->userdata('fb_access_token');
                 if(!$token){
                     $globalResults[]=['file'=>$fileArr['name'],'ig_user_id'=>$ig_uid,'status'=>'error','error'=>'no_token'];
                     continue;
@@ -403,7 +567,8 @@ class Instagram extends CI_Controller
                 if($finalMediaKind==='ig_reel'){
                     $res=$this->instagrampublisher->publishReel($ig_uid,$fullPath,$caption,$token);
                 } else {
-                    $res=$this->instagrampublisher->publishStory($ig_uid,$fullPath,$fileType,$token);
+                    $type = $finalMediaKind==='ig_story_image' ? 'image' : 'video';
+                    $res=$this->instagrampublisher->publishStory($ig_uid,$fullPath,$type,$token);
                 }
 
                 if(!$res['ok']){
@@ -466,11 +631,6 @@ class Instagram extends CI_Controller
 
     public function listing(){
         $user_id=$this->requireLogin();
-        $active=$this->db->from('instagram_accounts')
-                         ->where('user_id',$user_id)
-                         ->where('ig_linked',1)
-                         ->where('status','active')->count_all_results();
-        if($active==0){ $this->syncInstagramAccounts($user_id); }
 
         $filter=[
             'ig_user_id'=>trim($this->input->get('ig_user_id')),
@@ -492,13 +652,16 @@ class Instagram extends CI_Controller
         $total=$this->Instagram_reels_model->count_by_user($user_id,$filter);
         $summary=$this->Instagram_reels_model->summary_counts($user_id);
 
-        $accounts=$this->db->select('ig_user_id,ig_username,page_name,ig_profile_picture')
-                           ->from('instagram_accounts')
-                           ->where('user_id',$user_id)
-                           ->where('ig_linked',1)
-                           ->where('ig_user_id IS NOT NULL',null,false)
-                           ->where('status','active')
-                           ->order_by('page_name','ASC')->get()->result_array();
+        $accountsFull = $this->getPlatformAccounts($user_id, false);
+        $accounts=[];
+        foreach($accountsFull as $a){
+            $accounts[]=[
+                'ig_user_id'=>$a['ig_user_id'],
+                'ig_username'=>$a['ig_username'],
+                'page_name'=>$a['page_name'],
+                'ig_profile_picture'=>$a['ig_profile_picture'],
+            ];
+        }
 
         $data=[
             'items'=>$items,'total'=>$total,'page'=>$page,'limit'=>$limit,
@@ -533,11 +696,8 @@ class Instagram extends CI_Controller
         $processed=[];
         foreach($due as $row){
             $id=(int)$row['id'];
-            $account=$this->db->select('*')->from('instagram_accounts')
-                              ->where('user_id',$row['user_id'])
-                              ->where('ig_user_id',$row['ig_user_id'])
-                              ->where('ig_linked',1)
-                              ->where('status','active')->get()->row_array();
+
+            $account = $this->getPlatformAccountByIgUserId((int)$row['user_id'], (string)$row['ig_user_id'], false);
             if(!$account){
                 $this->Instagram_reels_model->mark_failed($id,'account_not_found');
                 $processed[]=['id'=>$id,'status'=>'failed','reason'=>'account_not_found'];
@@ -547,11 +707,10 @@ class Instagram extends CI_Controller
 
             $this->Instagram_reels_model->mark_publishing($id);
 
-            $token=$account['access_token'];
+            $token=$account['page_access_token'] ?? null;
             if(!$token){
                 if(($row['attempt_count']+1)<self::MAX_CRON_ATTEMPTS){
                     $this->Instagram_reels_model->reschedule_for_retry($id,self::RETRY_DELAY_MINUTES);
-                    // FIXED: تم تصحيح المسافة هنا
                     $this->logCron("ID $id retry no_token");
                 } else {
                     $this->Instagram_reels_model->mark_failed($id,'no_token');
@@ -569,6 +728,94 @@ class Instagram extends CI_Controller
                 continue;
             }
 
+            // --- NEW: handle existing creation_id safely: poll then publish only if FINISHED
+            $creationId = isset($row['creation_id']) ? trim($row['creation_id']) : '';
+            if ($creationId !== '') {
+                // poll creation status once
+                $pollUrl = 'https://graph.facebook.com/v19.0/' . rawurlencode($creationId) . '?fields=status_code&access_token=' . rawurlencode($token);
+                $pollRes = $this->httpRequestWithRetry('GET', $pollUrl, [], 2, 500);
+
+                if (!$pollRes['ok']) {
+                    // network/transient issue: reschedule
+                    $this->logCron("ID $id poll_network_issue: " . json_encode($pollRes));
+                    $this->Instagram_reels_model->reschedule_for_retry($id, self::RETRY_DELAY_MINUTES);
+                    $processed[]=['id'=>$id,'status'=>'delayed','reason'=>'poll_network_issue'];
+                    continue;
+                }
+
+                $pdata = json_decode($pollRes['body'] ?? '{}', true);
+                $statusCode = $pdata['status_code'] ?? null;
+
+                if ($statusCode === 'FINISHED') {
+                    // safe to publish now
+                    $pubUrl = 'https://graph.facebook.com/v19.0/' . rawurlencode($row['ig_user_id']) . '/media_publish';
+                    $postFields = http_build_query(['creation_id' => $creationId, 'access_token' => $token]);
+                    $pubRes = $this->httpRequestWithRetry('POST', $pubUrl, ['post_fields' => $postFields, 'timeout' => 60], 2, 500);
+
+                    if ($pubRes['ok'] && ($pubRes['http_code'] ?? 0) === 200) {
+                        $pubBody = json_decode($pubRes['body'] ?? '{}', true);
+                        $mediaId = $pubBody['id'] ?? null;
+                        if ($mediaId) {
+                            $this->Instagram_reels_model->mark_published($id,$mediaId,$creationId);
+                            $this->logCron("ID $id published media=".$mediaId);
+                            $processed[]=['id'=>$id,'status'=>'published'];
+                            // proceed to handle comments below after marking published
+                        } else {
+                            // unexpected: publish returned 200 but no id
+                            $this->logCron("ID $id publish_no_media_id: " . json_encode($pubRes));
+                            $this->db->where('id',$id)->update('instagram_reels',['creation_id'=>null,'status'=>'pending']);
+                            $processed[]=['id'=>$id,'status'=>'failed','reason'=>'publish_no_media_id'];
+                            continue;
+                        }
+                    } else {
+                        // publish failed - common case "Media ID is not available" or other FB error
+                        $this->logCron("ID $id publish_failed_raw: " . json_encode($pubRes));
+                        // clear creation_id so next run will recreate container
+                        $this->db->where('id',$id)->update('instagram_reels',['creation_id'=>null,'status'=>'pending']);
+                        $this->Instagram_reels_model->reschedule_for_retry($id, self::RETRY_DELAY_MINUTES);
+                        $processed[]=['id'=>$id,'status'=>'failed','reason'=>'publish_failed'];
+                        continue;
+                    }
+
+                    // if published and comments exist, post them
+                    $rowAfter = $this->Instagram_reels_model->get_by_id($id);
+                    if ($rowAfter && $rowAfter['media_id'] && !empty($rowAfter['comments_json'])) {
+                        $comments = json_decode($rowAfter['comments_json'], true);
+                        if (is_array($comments) && $comments) {
+                            $comments_result = $this->post_reel_comments($rowAfter['media_id'], $comments, $token);
+                            $first_comment_id = null;
+                            foreach($comments_result as $cr){ if($cr['status']==='ok'){ $first_comment_id=$cr['comment_id']; break; } }
+                            $this->db->where('id',$id)->update('instagram_reels',[
+                                'first_comment_id'=>$first_comment_id,
+                                'comments_publish_result_json'=>json_encode($comments_result,JSON_UNESCAPED_UNICODE),
+                                'updated_at'=>gmdate('Y-m-d H:i:s')
+                            ]);
+                        }
+                    }
+                    // finished processing this row (either published or handled)
+                    continue;
+                } elseif ($statusCode === 'IN_PROGRESS') {
+    // not ready yet — use longer wait for story videos and reels (they need more processing time)
+    $specialDelay = self::RETRY_DELAY_MINUTES;
+    if (!empty($row['media_kind']) && in_array($row['media_kind'], ['ig_story_video','ig_reel'], true)) {
+        // give video content more time (e.g. 5 minutes)
+        $specialDelay = 5;
+    }
+    $this->Instagram_reels_model->reschedule_for_retry($id, $specialDelay);
+    $this->logCron("ID $id still IN_PROGRESS, rescheduled for {$specialDelay} minutes");
+    $processed[]=['id'=>$id,'status'=>'delayed','reason'=>'in_progress'];
+    continue;
+                } else {
+                    // unknown or ERROR state — clear creation and set to pending to recreate
+                    $this->logCron("ID $id creation_invalid_or_error: " . json_encode($pdata));
+                    $this->db->where('id',$id)->update('instagram_reels',['creation_id'=>null,'status'=>'pending']);
+                    $processed[]=['id'=>$id,'status'=>'failed','reason'=>'creation_invalid'];
+                    continue;
+                }
+            }
+             // --- end creation_id handling ---
+
+            // If no creation_id, create/publish flow via InstagramPublisher (existing logic)
             if($row['media_kind']==='ig_reel'){
                 $res=$this->instagrampublisher->publishReel($row['ig_user_id'],$finalPath,$row['description'],$token);
             } elseif(in_array($row['media_kind'],['ig_story_image','ig_story_video'],true)){
@@ -578,6 +825,7 @@ class Instagram extends CI_Controller
                 $res=['ok'=>false,'error'=>'unsupported_kind'];
             }
 
+            // handle negative result from publisher
             if(!$res['ok']){
                 if(($row['attempt_count']+1)<self::MAX_CRON_ATTEMPTS){
                     $this->Instagram_reels_model->reschedule_for_retry($id,self::RETRY_DELAY_MINUTES);
@@ -590,9 +838,30 @@ class Instagram extends CI_Controller
                 continue;
             }
 
-            $this->Instagram_reels_model->mark_published($id,$res['media_id'],$res['creation_id'] ?? null);
-            $this->logCron("ID $id published media=".$res['media_id']);
+            // on success (instagrampublisher returned ok), handle three cases safely
+            if (!empty($res['media_id'])) {
+                // Final published — mark as published and continue (comments handled below)
+                $this->Instagram_reels_model->mark_published($id, $res['media_id'], $res['creation_id'] ?? null);
+                $this->logCron("ID $id published media=" . $res['media_id']);
+            } elseif (!empty($res['creation_id'])) {
+                // Container created but processing not finished — store creation_id and set status 'publishing'
+                $this->db->where('id', $id)->update('instagram_reels', [
+                    'creation_id' => $res['creation_id'],
+                    'status' => 'publishing',
+                    'updated_at' => gmdate('Y-m-d H:i:s')
+                ]);
+                $this->logCron("ID $id container_created creation_id=" . $res['creation_id'] . " (processing)");
+                $processed[] = ['id' => $id, 'status' => 'delayed', 'reason' => 'processing'];
+                continue;
+            } else {
+                // unexpected: ok==true but neither media_id nor creation_id — treat as transient failure
+                $this->logCron("ID $id unexpected_publish_result: " . json_encode($res));
+                $this->Instagram_reels_model->reschedule_for_retry($id, self::RETRY_DELAY_MINUTES);
+                $processed[] = ['id' => $id, 'status' => 'failed', 'reason' => 'no_media_id_no_creation_id'];
+                continue;
+            }
 
+            // if we reach here, the row is published (media_id available)
             if($row['media_kind']==='ig_reel' && !empty($row['comments_json'])){
                 $comments=json_decode($row['comments_json'],true);
                 if(is_array($comments) && $comments){
@@ -627,6 +896,7 @@ class Instagram extends CI_Controller
             echo json_encode(['status'=>'ok','processed'=>$processed],JSON_UNESCAPED_UNICODE);
         }
     }
+
 
     public function cron_debug(){
         $this->requireLogin();
@@ -706,33 +976,56 @@ class Instagram extends CI_Controller
             $msg=trim($msg);
             if($msg==='') continue;
             $url=$base.$media_id.'/comments';
-            $postFields=http_build_query([
-                'message'=>$msg,
-                'access_token'=>$accessToken
+            $postFields = http_build_query([
+                'message' => $msg,
+                'access_token' => $accessToken
             ]);
-            $ch=curl_init($url);
-            curl_setopt_array($ch, [
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_SSL_VERIFYPEER => true,
-                CURLOPT_TIMEOUT        => 60,
-                CURLOPT_POST           => true,
-                CURLOPT_POSTFIELDS     => $postFields
-            ]);
-            $body=curl_exec($ch);
-            $err=curl_error($ch);
-            $code=curl_getinfo($ch,CURLINFO_HTTP_CODE);
-            curl_close($ch);
-            if($err){
-                $out[]=['i'=>$i+1,'status'=>'error','error'=>$err];
-            } else {
-                $data=json_decode($body,true);
-                if(isset($data['id'])){
-                    $out[]=['i'=>$i+1,'status'=>'ok','comment_id'=>$data['id']];
-                } else {
-                    $out[]=['i'=>$i+1,'status'=>'error','http_code'=>$code,'raw'=>$data];
+            $attempt = 0;
+            $maxAttempts = 4;
+            $delayMs = 500;
+            $savedResult = null;
+            while ($attempt < $maxAttempts) {
+                $attempt++;
+                $res = $this->httpRequestWithRetry('POST', $url, ['post_fields' => $postFields, 'timeout' => 60], 1, $delayMs);
+                if (!$res['ok']) {
+                    if ($attempt < $maxAttempts) {
+                        usleep($delayMs * 1000);
+                        $delayMs = min(60000, (int)($delayMs * 1.8));
+                        continue;
+                    }
+                    $savedResult = ['i'=>$i+1,'status'=>'error','error'=>$res['error']];
+                    break;
                 }
+                $code = $res['http_code'] ?? 0;
+                $body = $res['body'] ?? '';
+                $hdrs = $res['headers'] ?? [];
+                $data = json_decode($body, true);
+                if(isset($data['id'])){
+                    $savedResult = ['i'=>$i+1,'status'=>'ok','comment_id'=>$data['id']];
+                    break;
+                }
+                if(isset($data['error'])){
+                    $err = $data['error'];
+                    $errCode = $err['code'] ?? null;
+                    $errMsg = $err['message'] ?? json_encode($err);
+                    if ($errCode === 4 || stripos($errMsg, 'rate') !== false || in_array($code, [429,500,502,503,504], true)) {
+                        if ($attempt < $maxAttempts) {
+                            usleep($delayMs * 1000);
+                            $delayMs = min(60000, (int)($delayMs * 1.8));
+                            continue;
+                        }
+                        $savedResult = ['i'=>$i+1,'status'=>'error','http_code'=>$code,'error'=>'rate_limit_or_server','raw'=>$data];
+                        break;
+                    }
+                    $savedResult = ['i'=>$i+1,'status'=>'error','http_code'=>$code,'error'=>$errMsg,'raw'=>$data];
+                    break;
+                }
+                $savedResult = ['i'=>$i+1,'status'=>'error','http_code'=>$code,'raw'=>$data];
+                break;
             }
-            usleep(250000);
+            if($savedResult===null){ $savedResult=['i'=>$i+1,'status'=>'error','error'=>'unknown']; }
+            $out[]=$savedResult;
+            usleep(150000); // small throttle
         }
         return $out;
     }
