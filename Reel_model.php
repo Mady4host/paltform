@@ -7,9 +7,9 @@ class Reel_model extends CI_Model
     private $image_exts = ['jpg','jpeg','png','webp'];
 
     /* إعدادات التعليقات المجدولة */
-    const COMMENT_MAX_ATTEMPTS        = 8;
-    const COMMENT_RETRY_DELAY_SEC     = 120;
-    const COMMENT_READY_TIMEOUT_TRIES = 5;
+    const COMMENT_MAX_ATTEMPTS        = 20;
+    const COMMENT_RETRY_DELAY_SEC     = 30;
+    const COMMENT_READY_TIMEOUT_TRIES = 20;
 
     /* القصص */
     const STORY_EXPIRE_SECONDS        = 86400;
@@ -656,67 +656,344 @@ private function storyLog(string $label, array $ctx = []): void
     }
 
     /* التعليقات كما هي */
-     private function handle_video_comments($user_id,$fb_page_id,$video_id,$raw_comments,$tz_offset,$video_scheduled,$video_utc_schedule,$page_token)
-    {
-        if(!$raw_comments) return;
-        if(!$this->db->table_exists('scheduled_comments')) return;
-        $now=time();
-        foreach($raw_comments as $c){
-            $text=trim($c['text'] ?? '');
-            $local=trim($c['schedule'] ?? '');
-            if($text==='') continue;
-            $utc = $local ? $this->localToUtc($local,$tz_offset) : null;
+     private function handle_video_comments($user_id, $fb_page_id, $video_id, $raw_comments, $tz_offset, $video_scheduled, $video_utc_schedule, $page_token)
+{
+    if (!$raw_comments) return;
+    if (!$this->db->table_exists('scheduled_comments')) return;
 
-            if($video_scheduled){
-                $schedule_time = $utc ?: $video_utc_schedule;
-                $vts = strtotime($video_utc_schedule);
-                $cts = strtotime($schedule_time);
-                if($cts <= $vts) $schedule_time = gmdate('Y-m-d H:i:s',$vts+300);
-                $this->db->insert('scheduled_comments',[
-                    'scheduled_reel_id'=>NULL,'user_id'=>$user_id,'fb_page_id'=>$fb_page_id,'video_id'=>$video_id,
-                    'comment_text'=>$text,'scheduled_time'=>$schedule_time,'status'=>'pending','attempt_count'=>0,
-                    'last_error'=>NULL,'created_at'=>gmdate('Y-m-d H:i:s')
-                ]);
-                continue;
-            }
+    $now = time();
+    foreach ($raw_comments as $c) {
+        $text = trim($c['text'] ?? '');
+        $local = trim($c['schedule'] ?? '');
+        if ($text === '') continue;
+        $utc = $local ? $this->localToUtc($local, $tz_offset) : null;
 
-            if($utc && strtotime($utc) > $now+15){
-                $this->db->insert('scheduled_comments',[
-                    'scheduled_reel_id'=>NULL,'user_id'=>$user_id,'fb_page_id'=>$fb_page_id,'video_id'=>$video_id,
-                    'comment_text'=>$text,'scheduled_time'=>$utc,'status'=>'pending','attempt_count'=>0,
-                    'last_error'=>NULL,'created_at'=>gmdate('Y-m-d H:i:s')
+        // 1) لو الفيديو مجدول — سجّل التعليق كمجدول
+        if ($video_scheduled) {
+            $schedule_time = $utc ?: $video_utc_schedule;
+            $vts = strtotime($video_utc_schedule);
+            $cts = strtotime($schedule_time);
+            if ($cts <= $vts) $schedule_time = gmdate('Y-m-d H:i:s', $vts + 300);
+            $this->db->insert('scheduled_comments', [
+                'scheduled_reel_id' => NULL,
+                'user_id' => $user_id,
+                'fb_page_id' => $fb_page_id,
+                'video_id' => $video_id,
+                'comment_text' => $text,
+                'scheduled_time' => $schedule_time,
+                'status' => 'pending',
+                'attempt_count' => 0,
+                'last_error' => NULL,
+                'created_at' => gmdate('Y-m-d H:i:s')
+            ]);
+            continue;
+        }
+
+        // 2) إذا وقت محلي مستقبلي => جدولة
+        if ($utc && strtotime($utc) > $now + 15) {
+            $this->db->insert('scheduled_comments', [
+                'scheduled_reel_id' => NULL,
+                'user_id' => $user_id,
+                'fb_page_id' => $fb_page_id,
+                'video_id' => $video_id,
+                'comment_text' => $text,
+                'scheduled_time' => $utc,
+                'status' => 'pending',
+                'attempt_count' => 0,
+                'last_error' => NULL,
+                'created_at' => gmdate('Y-m-d H:i:s')
+            ]);
+            continue;
+        }
+
+        // 3) قبل إرسال التعليق، تحقق إنّ الفيديو/المنشور جاهز باستخدام getVideoStatus
+        $status = null;
+        try {
+            $status = $this->getVideoStatus($video_id, $page_token);
+        } catch (\Throwable $e) {
+            $status = null;
+        }
+
+        if ($status === null || strtolower($status) !== 'ready') {
+            // سجل وأعد جدولة بدل محاولة فوريّة
+            $this->commentLog('IMMEDIATE_DELAY_NOT_READY', [
+                'video_id' => $video_id,
+                'status' => $status,
+                'note' => 'not ready or unknown'
+            ]);
+
+            $rowExisting = $this->db
+                ->where('user_id', $user_id)
+                ->where('fb_page_id', $fb_page_id)
+                ->where('video_id', $video_id)
+                ->where('comment_text', $text)
+                ->where("status !=", 'posted')
+                ->order_by('id', 'desc')
+                ->limit(1)
+                ->get('scheduled_comments')
+                ->row_array();
+
+            $attempt = $rowExisting ? ((int)$rowExisting['attempt_count'] + 1) : 1;
+            $delay = min(($attempt * $attempt) * 30, 3600);
+            $next_time = gmdate('Y-m-d H:i:s', time() + $delay);
+
+            if ($rowExisting) {
+                $this->db->where('id', $rowExisting['id'])->update('scheduled_comments', [
+                    'scheduled_time' => $next_time,
+                    'status' => 'pending',
+                    'attempt_count' => $attempt,
+                    'last_error' => 'not ready: ' . ($status ?? 'unknown')
                 ]);
             } else {
-                $res=$this->post_comment_now($video_id,$page_token,$text);
-                $j=json_decode($res,true);
-                if(isset($j['error'])){
-                    $this->commentLog('IMMEDIATE_FAIL',['video_id'=>$video_id,'error'=>$j['error']]);
-                    $this->db->insert('scheduled_comments',[
-                        'scheduled_reel_id'=>NULL,'user_id'=>$user_id,'fb_page_id'=>$fb_page_id,'video_id'=>$video_id,
-                        'comment_text'=>$text,'scheduled_time'=>gmdate('Y-m-d H:i:s'),'status'=>'failed',
-                        'attempt_count'=>1,'last_error'=>substr(json_encode($j['error'],JSON_UNESCAPED_UNICODE),0,500),
-                        'created_at'=>gmdate('Y-m-d H:i:s')
+                $this->db->insert('scheduled_comments', [
+                    'scheduled_reel_id' => NULL,
+                    'user_id' => $user_id,
+                    'fb_page_id' => $fb_page_id,
+                    'video_id' => $video_id,
+                    'comment_text' => $text,
+                    'scheduled_time' => $next_time,
+                    'status' => 'pending',
+                    'attempt_count' => $attempt,
+                    'last_error' => 'not ready: ' . ($status ?? 'unknown'),
+                    'created_at' => gmdate('Y-m-d H:i:s')
+                ]);
+            }
+            continue;
+        }
+
+        // 4) الفيديو جاهز => حاول نشر التعليق مع فالباك
+        $res = $this->try_post_comment_with_fallback($video_id, $page_token, $text, $fb_page_id);
+
+        $http = (int)($res['http'] ?? 0);
+        $curl_err = $res['err'] ?? '';
+        $body = $res['body'] ?? '';
+        $j = @json_decode($body, true);
+
+        if (!empty($curl_err) || $http >= 400 || (is_array($j) && isset($j['error'])) || ($body === '')) {
+            $this->commentLog('IMMEDIATE_FAIL', [
+                'video_id' => $video_id,
+                'http' => $http,
+                'curl_err' => $curl_err,
+                'body_preview' => substr($body, 0, 1000)
+            ]);
+
+            $errArr = is_array($j) ? ($j['error'] ?? []) : [];
+            $ecode = isset($errArr['code']) ? intval($errArr['code']) : null;
+            $esub = isset($errArr['error_subcode']) ? intval($errArr['error_subcode']) : null;
+            $errorMessage = $curl_err ?: (is_array($errArr) ? substr(json_encode($errArr, JSON_UNESCAPED_UNICODE), 0, 500) : 'HTTP ' . $http);
+
+            $shouldRetry = ($ecode === 12) || ($ecode === 100 && $esub === 33) || ($http >= 500);
+
+            $rowExisting = $this->db
+                ->where('user_id', $user_id)
+                ->where('fb_page_id', $fb_page_id)
+                ->where('video_id', $video_id)
+                ->where('comment_text', $text)
+                ->where("status !=", 'posted')
+                ->order_by('id', 'desc')
+                ->limit(1)
+                ->get('scheduled_comments')
+                ->row_array();
+
+            $attempt = $rowExisting ? ((int)$rowExisting['attempt_count'] + 1) : 1;
+
+            if ($shouldRetry && $attempt <= self::COMMENT_MAX_ATTEMPTS) {
+                $delay = min(($attempt * $attempt) * 30, 3600);
+                $next_time = gmdate('Y-m-d H:i:s', time() + $delay);
+
+                if ($rowExisting) {
+                    $this->db->where('id', $rowExisting['id'])->update('scheduled_comments', [
+                        'scheduled_time' => $next_time,
+                        'status' => 'pending',
+                        'attempt_count' => $attempt,
+                        'last_error' => substr($errorMessage, 0, 500)
                     ]);
                 } else {
-                    $this->commentLog('IMMEDIATE_OK',['video_id'=>$video_id]);
-                    $this->db->insert('scheduled_comments',[
-                        'scheduled_reel_id'=>NULL,'user_id'=>$user_id,'fb_page_id'=>$fb_page_id,'video_id'=>$video_id,
-                        'comment_text'=>$text,'scheduled_time'=>gmdate('Y-m-d H:i:s'),'status'=>'posted',
-                        'attempt_count'=>1,'last_error'=>NULL,'posted_time'=>gmdate('Y-m-d H:i:s'),
-                        'created_at'=>gmdate('Y-m-d H:i:s')
+                    $this->db->insert('scheduled_comments', [
+                        'scheduled_reel_id' => NULL,
+                        'user_id' => $user_id,
+                        'fb_page_id' => $fb_page_id,
+                        'video_id' => $video_id,
+                        'comment_text' => $text,
+                        'scheduled_time' => $next_time,
+                        'status' => 'pending',
+                        'attempt_count' => $attempt,
+                        'last_error' => substr($errorMessage, 0, 500),
+                        'created_at' => gmdate('Y-m-d H:i:s')
                     ]);
                 }
+
+                $this->commentLog('IMMEDIATE_RETRY', [
+                    'video_id' => $video_id,
+                    'next' => $next_time,
+                    'attempt' => $attempt,
+                    'reason' => $errorMessage
+                ]);
+            } else {
+                if ($rowExisting) {
+                    $this->db->where('id', $rowExisting['id'])->update('scheduled_comments', [
+                        'scheduled_time' => gmdate('Y-m-d H:i:s'),
+                        'status' => 'failed',
+                        'attempt_count' => $attempt,
+                        'last_error' => substr($errorMessage, 0, 500)
+                    ]);
+                } else {
+                    $this->db->insert('scheduled_comments', [
+                        'scheduled_reel_id' => NULL,
+                        'user_id' => $user_id,
+                        'fb_page_id' => $fb_page_id,
+                        'video_id' => $video_id,
+                        'comment_text' => $text,
+                        'scheduled_time' => gmdate('Y-m-d H:i:s'),
+                        'status' => 'failed',
+                        'attempt_count' => $attempt,
+                        'last_error' => substr($errorMessage, 0, 500),
+                        'created_at' => gmdate('Y-m-d H:i:s')
+                    ]);
+                }
+
+                $this->commentLog('IMMEDIATE_FAIL_FINAL', [
+                    'video_id' => $video_id,
+                    'attempt' => $attempt,
+                    'reason' => $errorMessage
+                ]);
             }
+        } else {
+            // نجاح فوري
+            $this->commentLog('IMMEDIATE_OK', [
+                'video_id' => $video_id,
+                'resp' => (is_array($j) ? $j : substr($body, 0, 1000))
+            ]);
+            $this->db->insert('scheduled_comments', [
+                'scheduled_reel_id' => NULL,
+                'user_id' => $user_id,
+                'fb_page_id' => $fb_page_id,
+                'video_id' => $video_id,
+                'comment_text' => $text,
+                'scheduled_time' => gmdate('Y-m-d H:i:s'),
+                'status' => 'posted',
+                'attempt_count' => 1,
+                'last_error' => NULL,
+                'posted_time' => gmdate('Y-m-d H:i:s'),
+                'created_at' => gmdate('Y-m-d H:i:s')
+            ]);
         }
     }
-    private function post_comment_now($video_id,$access_token,$message)
-    {
-        $url="https://graph.facebook.com/v23.0/{$video_id}/comments";
-        $ch=curl_init($url);
-        curl_setopt_array($ch,[CURLOPT_POST=>1,CURLOPT_POSTFIELDS=>http_build_query(['access_token'=>$access_token,'message'=>$message]),CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false]);
-        $r=curl_exec($ch); curl_close($ch);
-        return $r;
+}
+    private function post_comment_now($target_id, $access_token, $message)
+{
+    $url = "https://graph.facebook.com/{$this->graphVersion()}/{$target_id}/comments";
+    $postFields = http_build_query(['access_token' => $access_token, 'message' => $message]);
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_POST => 1,
+        CURLOPT_POSTFIELDS => $postFields,
+        CURLOPT_RETURNTRANSFER => 1,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_TIMEOUT => 25,
+    ]);
+    $body = curl_exec($ch);
+    $err  = curl_error($ch);
+    $http = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    $this->writeLog('reels_comments.log', "POST_COMMENT target={$target_id} http={$http} curl_err=" . ($err?:'') . " msg_preview=" . substr($message,0,200) . " resp_preview=" . substr($body?:'',0,2000));
+
+    return ['http' => (int)$http, 'body' => (string)($body ?? ''), 'err' => (string)($err ?? '')];
+}
+
+private function resolvePostIdFromVideo($video_id, $access_token)
+{
+    $version = $this->graphVersion() ?: 'v23.0';
+    $url = "https://graph.facebook.com/{$version}/{$video_id}?fields=post_id,permalink_url&access_token=" . urlencode($access_token);
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_CONNECTTIMEOUT => 8,
+        CURLOPT_TIMEOUT => 12
+    ]);
+    $raw = curl_exec($ch);
+    $err = curl_error($ch);
+    $http = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    $this->writeLog('reels_comments.log', "RESOLVE_POST_ID video={$video_id} http={$http} curl_err={$err} resp_preview=" . substr($raw?:'',0,1000));
+    $j = @json_decode($raw, true);
+
+    if (is_array($j) && !empty($j['post_id'])) {
+        return (string)$j['post_id'];
     }
+    if (is_array($j) && !empty($j['permalink_url'])) {
+        if (preg_match('#/posts/([0-9_]+)#', $j['permalink_url'], $m)) {
+            return $m[1];
+        }
+    }
+    return null;
+}
+
+private function try_post_comment_with_fallback($target_video_id, $access_token, $message, $fb_page_id = null)
+{
+    // 0) حاول استخدام post_id مخزّن في جدول reels (ابحث في post_id أو video_id بحيث نعالج أي حالة)
+    try {
+        $row = $this->db->select('post_id,video_id')
+                        ->from('reels')
+                        ->group_start()
+                            ->where('video_id', $target_video_id)
+                            ->or_where('post_id', $target_video_id)
+                        ->group_end()
+                        ->order_by('id','desc')
+                        ->limit(1)
+                        ->get()
+                        ->row_array();
+        if (!empty($row['post_id'])) {
+            $this->writeLog('reels_comments.log', "COMMENT_USE_STORED_POSTID video={$target_video_id} post_id={$row['post_id']}");
+            return $this->post_comment_now($row['post_id'], $access_token, $message);
+        }
+    } catch (\Throwable $e) {
+        $this->writeLog('reels_comments.log', "COMMENT_DB_LOOKUP_ERR video={$target_video_id} err=" . $e->getMessage());
+    }
+
+    // 1) محاولة أولى على target_video_id مباشرة
+    $res = $this->post_comment_now($target_video_id, $access_token, $message);
+    $http = $res['http'] ?? 0;
+    $body = $res['body'] ?? '';
+    $err  = $res['err'] ?? '';
+
+    $j = @json_decode($body, true);
+    $isErr12 = is_array($j) && isset($j['error']) && intval($j['error']['code'] ?? 0) === 12;
+    $msgContainsSingular = is_string($body) && stripos($body, 'singular statuses') !== false;
+
+    if (($http >= 400 && ($isErr12 || $msgContainsSingular)) || ($http >= 400 && !empty($err))) {
+        $this->writeLog('reels_comments.log', "COMMENT_FALLBACK_TRIGGER target={$target_video_id} http={$http} curl_err={$err} reason=" . ($isErr12 ? 'error12' : 'other'));
+
+        // 2) حاول استرداد post_id من الفيديو عبر Graph
+        $postId = $this->resolvePostIdFromVideo($target_video_id, $access_token);
+        if ($postId) {
+            $this->writeLog('reels_comments.log', "COMMENT_FALLBACK_POSTID_FOUND video={$target_video_id} post_id={$postId}");
+            $res2 = $this->post_comment_now($postId, $access_token, $message);
+            $this->writeLog('reels_comments.log', "COMMENT_FALLBACK_TRY_POSTID post_id={$postId} result_http=" . ($res2['http'] ?? 0) . " resp_preview=" . substr($res2['body'] ?? '',0,500));
+            return $res2;
+        }
+
+        // 3) محاولة الصيغة المركبة pageId_videoId كخيار أخير (لو متوفر fb_page_id)
+        if (!empty($fb_page_id)) {
+            $constructed = $fb_page_id . '_' . $target_video_id;
+            $this->writeLog('reels_comments.log', "COMMENT_FALLBACK_TRY_CONSTRUCTED post_target={$constructed}");
+            $res3 = $this->post_comment_now($constructed, $access_token, $message);
+            $this->writeLog('reels_comments.log', "COMMENT_FALLBACK_TRY_CONSTRUCTED result_http=" . ($res3['http'] ?? 0) . " resp_preview=" . substr($res3['body'] ?? '',0,500));
+            return $res3;
+        }
+
+        // إن لم يوجد فالباك صالح أعد نتيجة المحاولة الأولى
+        return $res;
+    }
+
+    // إن نجحت المحاولة الأولى أو لم تكن خطأ من النوع الذي نفحصه، أعد النتيجة
+    return $res;
+}
 
     /* ================= جدولة محلية ================= */
     public function get_due_scheduled_reels(int $limit = 40): array
@@ -944,39 +1221,73 @@ private function storyLog(string $label, array $ctx = []): void
     }
 
     public function process_scheduled_comment($row)
-    {
-        $page = $this->db->get_where('facebook_rx_fb_page_info',[
-            'page_id'=>$row['fb_page_id'],
-            'user_id'=>$row['user_id']
-        ])->row_array();
+{
+    // اقرأ بيانات الصفحة من جدول المنصة بدلاً من الجدول القديم
+    $page = $this->db->get_where('facebook_rx_fb_page_info',[
+        'page_id'=>$row['fb_page_id'],
+        'user_id'=>$row['user_id']
+    ])->row_array();
 
-        if(!$page || empty($page['page_access_token'])){
-            $this->failComment($row,'توكن مفقود'); return;
-        }
-        if(empty($row['video_id'])){
-            $this->failComment($row,'video_id فارغ'); return;
-        }
-        $status = $this->getVideoStatus($row['video_id'],$page['page_access_token']);
-        if($status && $status!=='ready'){
-            $this->rescheduleComment($row,'video not ready: '.$status); return;
-        }
-        $res=$this->post_comment_now($row['video_id'],$page['page_access_token'],$row['comment_text']);
-        $j=json_decode($res,true);
-        if(isset($j['error'])){
-            $err = $j['error'];
-            $code = $err['code'] ?? null;
-            $sub  = $err['error_subcode'] ?? null;
-            if($code==100 && $sub==33 && $row['attempt_count'] < self::COMMENT_READY_TIMEOUT_TRIES){
-                $this->rescheduleComment($row,'retry Graph 100/33'); return;
-            }
-            $this->failComment($row,substr(json_encode($err,JSON_UNESCAPED_UNICODE),0,500)); return;
-        }
-        $this->db->where('id',$row['id'])->update('scheduled_comments',[
-            'status'=>'posted','posted_time'=>gmdate('Y-m-d H:i:s'),
-            'attempt_count'=>$row['attempt_count']+1,'last_error'=>NULL
-        ]);
-        $this->commentLog('SCHEDULED_OK',['id'=>$row['id'],'video_id'=>$row['video_id']]);
+    if(!$page || empty($page['page_access_token'])){
+        $this->failComment($row,'توكن مفقود'); return;
     }
+    if(empty($row['video_id'])){
+        $this->failComment($row,'video_id فارغ'); return;
+    }
+
+    // تحقق من حالة الفيديو/المنشور أولاً — إذا غير جاهز أعد الجدولة
+    $status = null;
+    try {
+        $status = $this->getVideoStatus($row['video_id'], $page['page_access_token']);
+    } catch (\Throwable $e) {
+        $status = null;
+    }
+
+    // إذا الحالة غير موجودة أو ليست 'ready' => أعد جدولة (منع محاولات فاشلة مبكرة)
+    if (!$status || strtolower($status) !== 'ready') {
+        $this->rescheduleComment($row, 'video not ready: ' . ($status ?? 'unknown'));
+        return;
+    }
+
+    // الآن الفيديو جاهز — حاول النشر مستخدمًا الفالباكات الذكية
+    $res = $this->try_post_comment_with_fallback($row['video_id'], $page['page_access_token'], $row['comment_text'], $row['fb_page_id']);
+
+    $http = (int)($res['http'] ?? 0);
+    $curl_err = $res['err'] ?? '';
+    $body = $res['body'] ?? '';
+    $j = @json_decode($body, true);
+
+    if (!empty($curl_err) || $http >= 400 || (is_array($j) && isset($j['error'])) || ($body === '')) {
+        // تعامل متشابه مع دالة النشر الفوري: حدد السبب وقرر إعادة الجدولة أو الفشل النهائي
+        $err = is_array($j) ? ($j['error'] ?? []) : [];
+        $code = $err['code'] ?? null;
+        $sub  = $err['error_subcode'] ?? null;
+
+        // لو الخطأ 100/33 أو 12 فاعتبرها غير جاهزة مؤقتًا وأعد جدولة (حتى حد المحاولات)
+        if (($code == 100 && $sub == 33) || ($code == 12) || $http >= 500) {
+            if ($row['attempt_count'] < self::COMMENT_READY_TIMEOUT_TRIES) {
+                $this->rescheduleComment($row, "retry due to code {$code}" . ($sub ? "/{$sub}" : ''));
+                return;
+            }
+            // لو تجاوزنا محاولات timeout falls-through to fail
+        }
+
+        // فشل نهائي
+        $msg = '';
+        if (!empty($curl_err)) $msg = 'cURL error: ' . $curl_err;
+        elseif (!empty($body)) $msg = substr($body,0,500);
+        else $msg = 'HTTP ' . $http;
+        $this->failComment($row, $msg);
+        return;
+    }
+
+    // نجاح: علّم التعليق كمعلَن
+    $this->db->where('id',$row['id'])->update('scheduled_comments',[
+        'status'=>'posted','posted_time'=>gmdate('Y-m-d H:i:s'),
+        'attempt_count'=>$row['attempt_count']+1,'last_error'=>NULL
+    ]);
+    $this->commentLog('SCHEDULED_OK',['id'=>$row['id'],'video_id'=>$row['video_id']]);
+}
     private function rescheduleComment($row,$reason)
     {
         $next = gmdate('Y-m-d H:i:s', time()+ self::COMMENT_RETRY_DELAY_SEC);
