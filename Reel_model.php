@@ -181,7 +181,7 @@ class Reel_model extends CI_Model
     }
     private function getVideoStatus($video_id,$access_token)
     {
-        $url="https://graph.facebook.com/v18.0/{$video_id}?fields=status&access_token=".urlencode($access_token);
+        $url="https://graph.facebook.com/v23.0/{$video_id}?fields=status&access_token=".urlencode($access_token);
         $ch=curl_init($url);
         curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false]);
         $res=curl_exec($ch); curl_close($ch);
@@ -347,55 +347,91 @@ class Reel_model extends CI_Model
         } unset($h);
 
         /* UPLOAD */
-        foreach($handles as $idx=>&$h){
-            if(!empty($h['error'])) continue;
-            $url="https://rupload.facebook.com/video-upload/{$this->graphVersion()}/{$h['video_id']}";
-            $ch=curl_init($url);
+foreach($handles as $idx=>&$h){
+    if(!empty($h['error'])) continue;
 
-            // استخدم نفس طريقة سابقة (POSTFIELDS) لكن سجل الاستجابة بحذر
-            curl_setopt_array($ch,[
-                CURLOPT_HTTPHEADER=>[
-                    "Authorization: OAuth {$h['job']['page_access_token']}",
-                    "offset: 0",
-                    "file_size: {$h['job']['file_size']}"
-                ],
-                CURLOPT_POST=>1,
-                CURLOPT_POSTFIELDS=>file_get_contents($h['job']['tmp_name']),
-                CURLOPT_RETURNTRANSFER=>1,
-                CURLOPT_SSL_VERIFYPEER=>false
-            ]);
-            $h['upload_ch']=$ch;
-            curl_multi_add_handle($mh,$ch);
-        } unset($h);
-        $this->runMulti($mh);
-        foreach($handles as $idx=>&$h){
-            if(!empty($h['error'])) continue;
-            $raw = @curl_multi_getcontent($h['upload_ch']);
-            if($raw === false || $raw === null){
-                $this->writeLog('reels_api.log',"UPLOAD_REELS_UPLOAD_EMPTY page={$h['job']['fb_page_id']} file={$h['job']['filename']}");
-                $res = null;
-            } else {
-                $this->writeLog('reels_api.log',"UPLOAD_REELS_UPLOAD_RESP page={$h['job']['fb_page_id']} file={$h['job']['filename']} resp_preview=".substr($raw,0,1000));
-                $res = json_decode($raw,true);
-                if($res === null && json_last_error() !== JSON_ERROR_NONE){
-                    $this->writeLog('reels_api.log',"UPLOAD_REELS_UPLOAD_JSON_FAIL page={$h['job']['fb_page_id']} raw_preview=".substr($raw,0,2000));
-                    // محاولة كشف success string شائعة
-                    if(strpos($raw,'"success"')!==false || strpos($raw,'Upload Successful')!==false){
-                        $res = ['success'=>true,'message'=>'ok'];
-                    }
-                }
+    // تحقق من وجود video_id أو upload_url
+    if (empty($h['video_id']) && empty($h['upload_url'])) {
+        $this->writeLog('reels_api.log',"UPLOAD_REELS_NO_VIDEO_OR_UPLOAD_URL page={$h['job']['fb_page_id']} file={$h['job']['filename']}");
+        $h['error'] = true;
+        $responses[] = ['type'=>'error','msg'=>"فشل: لا يوجد video_id أو upload_url لملف {$h['job']['filename']}"];
+        continue;
+    }
+
+    // استخدم upload_url المردّ من START إن وُجد، وإلا كوّن URL كـ fallback
+    $upload_url = isset($h['upload_url']) && $h['upload_url'] ? $h['upload_url'] : ("https://rupload.facebook.com/video-upload/{$this->graphVersion()}/{$h['video_id']}");
+    if (isset($h['upload_url']) && $h['upload_url']) {
+        $this->writeLog('reels_api.log',"UPLOAD_REELS_UPLOAD_URL_USED page={$h['job']['fb_page_id']} file={$h['job']['filename']} url=".$upload_url);
+    } else {
+        $this->writeLog('reels_api.log',"UPLOAD_REELS_UPLOAD_FALLBACK_URL_USED page={$h['job']['fb_page_id']} file={$h['job']['filename']} url=".$upload_url);
+    }
+
+    $ch = curl_init($upload_url);
+
+    // رؤوس الرفع — Authorization و offset و file_size مهمة
+    $headers = [
+        "Authorization: OAuth {$h['job']['page_access_token']}",
+        "offset: 0",
+        "file_size: {$h['job']['file_size']}"
+    ];
+
+    // اقرأ الملف كبايتس
+    $file_content = @file_get_contents($h['job']['tmp_name']);
+    if ($file_content === false) {
+        $this->writeLog('reels_api.log',"UPLOAD_REELS_READ_FILE_FAIL page={$h['job']['fb_page_id']} file={$h['job']['filename']} tmp={$h['job']['tmp_name']}");
+        $h['error'] = true;
+        $responses[] = ['type'=>'error','msg'=>"فشل قراءة الملف: {$h['job']['filename']}"];
+        continue;
+    }
+
+    curl_setopt_array($ch,[
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_POST => 1,
+        CURLOPT_POSTFIELDS => $file_content,
+        CURLOPT_RETURNTRANSFER => 1,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_TIMEOUT => 120
+    ]);
+
+    $h['upload_ch'] = $ch;
+    curl_multi_add_handle($mh,$ch);
+}
+unset($h);
+
+$this->runMulti($mh);
+
+foreach($handles as $idx=>&$h){
+    if(!empty($h['error'])) continue;
+
+    $raw = @curl_multi_getcontent($h['upload_ch']);
+    if($raw === false || $raw === null){
+        $this->writeLog('reels_api.log',"UPLOAD_REELS_UPLOAD_EMPTY page={$h['job']['fb_page_id']} file={$h['job']['filename']}");
+        $res = null;
+    } else {
+        $this->writeLog('reels_api.log',"UPLOAD_REELS_UPLOAD_RESP page={$h['job']['fb_page_id']} file={$h['job']['filename']} resp_preview=".substr($raw,0,1000));
+        $res = json_decode($raw,true);
+        if($res === null && json_last_error() !== JSON_ERROR_NONE){
+            $this->writeLog('reels_api.log',"UPLOAD_REELS_UPLOAD_JSON_FAIL page={$h['job']['fb_page_id']} raw_preview=".substr($raw,0,2000));
+            // محاولة كشف success string شائعة
+            if(strpos($raw,'"success"')!==false || strpos($raw,'Upload Successful')!==false){
+                $res = ['success'=>true,'message'=>'ok'];
             }
-            $this->apiLog('UPLOAD',$h['job'],$res);
-            @curl_multi_remove_handle($mh,$h['upload_ch']); @curl_close($h['upload_ch']);
-            unset($h['upload_ch']);
-            if(isset($res['error'])){
-                $h['error']=true;
-                $responses[]=['type'=>'error','msg'=>"فشل رفع البيانات: {$h['job']['filename']} ({$h['job']['fb_page_id']})"];
-                $this->writeLog('reels_api.log',"UPLOAD_REELS_UPLOAD_FAIL page={$h['job']['fb_page_id']} file={$h['job']['filename']} res=".(@$raw?:'empty'));
-            } else {
-                $this->writeLog('reels_api.log',"UPLOAD_REELS_UPLOAD_OK page={$h['job']['fb_page_id']} file={$h['job']['filename']}");
-            }
-        } unset($h);
+        }
+    }
+
+    $this->apiLog('UPLOAD',$h['job'],$res);
+    @curl_multi_remove_handle($mh,@$h['upload_ch']); @curl_close(@$h['upload_ch']);
+    unset($h['upload_ch']);
+
+    if(isset($res['error'])){
+        $h['error']=true;
+        $responses[]=['type'=>'error','msg'=>"فشل رفع البيانات: {$h['job']['filename']} ({$h['job']['fb_page_id']})"];
+        $this->writeLog('reels_api.log',"UPLOAD_REELS_UPLOAD_FAIL page={$h['job']['fb_page_id']} file={$h['job']['filename']} res=".(@$raw?:'empty'));
+    } else {
+        $this->writeLog('reels_api.log',"UPLOAD_REELS_UPLOAD_OK page={$h['job']['fb_page_id']} file={$h['job']['filename']}");
+    }
+}
+unset($h);
 
         /* FINISH */
         $coverDir=FCPATH.'uploads/reels_covers/';
@@ -444,11 +480,21 @@ class Reel_model extends CI_Model
             $this->apiLog('FINISH',$h['job'],$res);
             @curl_multi_remove_handle($mh,$h['finish_ch']); @curl_close($h['finish_ch']);
             unset($h['finish_ch']);
-            if(isset($res['error'])){
+
+            // New: require a publish identifier (id/post_id/video_id) to treat as success
+            $publishId = null;
+            if (is_array($res)) {
+                $publishId = $res['id'] ?? $res['post_id'] ?? $res['video_id'] ?? null;
+            }
+
+            if (!is_array($res) || isset($res['error']) || !$publishId) {
                 $responses[]=['type'=>'error','msg'=>"فشل إنهاء الرفع: {$h['job']['filename']} ({$h['job']['fb_page_id']})"];
                 $this->writeLog('reels_api.log',"UPLOAD_REELS_FINISH_FAIL page={$h['job']['fb_page_id']} file={$h['job']['filename']} res=".(@$raw?:'empty'));
                 continue;
             }
+
+            // If we have a publishId, use it as canonical video/post id
+            $h['video_id'] = $publishId;
 
             // أغلفة
             $idxJob = $h['job']['index'];
@@ -612,7 +658,7 @@ class Reel_model extends CI_Model
     }
     private function post_comment_now($video_id,$access_token,$message)
     {
-        $url="https://graph.facebook.com/v18.0/{$video_id}/comments";
+        $url="https://graph.facebook.com/v23.0/{$video_id}/comments";
         $ch=curl_init($url);
         curl_setopt_array($ch,[CURLOPT_POST=>1,CURLOPT_POSTFIELDS=>http_build_query(['access_token'=>$access_token,'message'=>$message]),CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false]);
         $r=curl_exec($ch); curl_close($ch);
@@ -728,11 +774,21 @@ public function process_scheduled_reel($row)
         $fRes = $this->curlForm($fUrl,$fData);
         $fJson = json_decode($fRes,true);
         $this->apiLogScheduled('FINISH',$row['fb_page_id'],$fileName,$fJson);
-        if (isset($fJson['error'])) {
-            $this->writeLog('reels_api_scheduled.log','PROCESS_FAIL finish_error id='.$row['id'].' err='.json_encode($fJson));
-            $this->failScheduled($row,$attempt,'فشل FINISH');
+
+        // New: require publish identifier
+        $publishId = null;
+        if (is_array($fJson)) {
+            $publishId = $fJson['id'] ?? $fJson['post_id'] ?? $video_id ?? null;
+        }
+
+        if (!is_array($fJson) || isset($fJson['error']) || !$publishId) {
+            $this->writeLog('reels_api_scheduled.log','PROCESS_FAIL finish_no_publish_id id='.$row['id'].' resp='.($fRes?:json_encode($fJson)));
+            $this->failScheduled($row,$attempt,'فشل FINISH / no publish id');
             return;
         }
+
+        // Use $publishId as canonical id (store it)
+        $video_id = $publishId;
 
         // حدّث حالة scheduled_reels مبكراً (كما كان)
         $this->db->where('id',$row['id'])->update('scheduled_reels',[
@@ -1126,160 +1182,277 @@ public function upload_story_photo($user_id,$pagesTokens,$post,$files)
 }
     /* رفع Story Video (نفس السابق) */
     public function upload_story_video($user_id,$pages,$post,$files)
-    {
-        if(!self::FEATURE_STORIES) return [['type'=>'error','msg'=>'القصص معطلة']];
-        $fb_page_ids    = $post['fb_page_ids'] ?? [];
-        $schedule_times = $post['schedule_times'] ?? [];
-        $descriptions   = $post['descriptions'] ?? [];
-        $video_files    = $files['video_files'] ?? null;
-        $tz_offset      = (int)($post['tz_offset_minutes'] ?? 0);
-        $tz_name        = $post['tz_name'] ?? '';
-        $global_desc    = trim($post['description'] ?? '');
+{
+    if(!self::FEATURE_STORIES) return [['type'=>'error','msg'=>'القصص معطلة']];
+    $fb_page_ids    = $post['fb_page_ids'] ?? [];
+    $schedule_times = $post['schedule_times'] ?? [];
+    $descriptions   = $post['descriptions'] ?? [];
+    $video_files    = $files['video_files'] ?? null;
+    $tz_offset      = (int)($post['tz_offset_minutes'] ?? 0);
+    $tz_name        = $post['tz_name'] ?? '';
+    $global_desc    = trim($post['description'] ?? '');
+    // جديد: publish_as => 'story'|'feed'|'reel'|'both'
+    $publish_as     = strtolower($post['publish_as'] ?? 'story');
 
-        if(!$video_files || empty($video_files['name'])) return [['type'=>'error','msg'=>'لا توجد ملفات فيديو']];
-        if(empty($fb_page_ids)) return [['type'=>'error','msg'=>'اختر صفحات']];
+    if(!$video_files || empty($video_files['name'])) return [['type'=>'error','msg'=>'لا توجد ملفات فيديو']];
+    if(empty($fb_page_ids)) return [['type'=>'error','msg'=>'اختر صفحات']];
 
-        $responses=[];
-        $cnt=count($video_files['name']);
-        $immediateJobs=[];
-        $version=$this->graphVersion();
+    $responses=[];
+    $cnt=count($video_files['name']);
+    $immediateJobs=[];
+    $version=$this->graphVersion();
 
-        for($i=0;$i<$cnt;$i++){
-            $fname=$video_files['name'][$i];
-            $tmp=$video_files['tmp_name'][$i];
-            $err=$video_files['error'][$i];
-            if($err !== UPLOAD_ERR_OK || !is_file($tmp)){ $responses[]=['type'=>'error','msg'=>"فشل الملف $fname"]; continue; }
-            $ext=strtolower(pathinfo($fname,PATHINFO_EXTENSION));
-            if(!in_array($ext,$this->video_exts)){ $responses[]=['type'=>'error','msg'=>"امتداد غير مدعوم: $fname"]; continue; }
-            $file_desc=trim($descriptions[$i] ?? '');
-            $base=pathinfo($fname,PATHINFO_FILENAME);
-            $caption = $file_desc ?: ($global_desc ?: $base);
-            $local_sched=$schedule_times[$i] ?? '';
-            $utc_sched=$this->localToUtc($local_sched,$tz_offset);
-            $is_future = $utc_sched && $this->isFutureUtc($utc_sched,60);
+    // تحضير الوظائف (كما في السابق)
+    for($i=0;$i<$cnt;$i++){
+        $fname=$video_files['name'][$i];
+        $tmp=$video_files['tmp_name'][$i];
+        $err=$video_files['error'][$i];
+        if($err !== UPLOAD_ERR_OK || !is_file($tmp)){ $responses[]=['type'=>'error','msg'=>"فشل الملف $fname"]; continue; }
+        $ext=strtolower(pathinfo($fname,PATHINFO_EXTENSION));
+        if(!in_array($ext,$this->video_exts)){ $responses[]=['type'=>'error','msg'=>"امتداد غير مدعوم: $fname"]; continue; }
+        $file_desc=trim($descriptions[$i] ?? '');
+        $base=pathinfo($fname,PATHINFO_FILENAME);
+        $caption = $file_desc ?: ($global_desc ?: $base);
+        $local_sched=$schedule_times[$i] ?? '';
+        $utc_sched=$this->localToUtc($local_sched,$tz_offset);
+        $is_future = $utc_sched && $this->isFutureUtc($utc_sched,60);
 
-            foreach($fb_page_ids as $pid){
-                $page=$this->findPage($pages,$pid);
-                if(!$page || empty($page['page_access_token'])){
-                    $responses[]=['type'=>'error','msg'=>"توكن مفقود للصفحة $pid"]; continue;
-                }
-                if($is_future){
-                    $dir=FCPATH.'uploads/scheduled/';
-                    if(!is_dir($dir)) @mkdir($dir,0775,true);
-                    $safe=preg_replace('/[^a-zA-Z0-9_\-\.]/','_',$fname);
-                    $stored='story_sched_'.time().'_'.$i.'_'.mt_rand(1000,9999).'_'.$safe;
-                    if(!move_uploaded_file($tmp,$dir.$stored)){
-                        $responses[]=['type'=>'error','msg'=>"تعذر تخزين مجدول $fname"]; continue;
-                    }
-                    $orig_local = preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/',$local_sched)
-                        ? str_replace('T',' ',$local_sched).':00' : null;
-                    $ins=[
-                        'user_id'=>$user_id,'fb_page_id'=>$pid,'video_path'=>'uploads/scheduled/'.$stored,
-                        'description'=>$caption,'scheduled_time'=>$utc_sched,'original_local_time'=>$orig_local,
-                        'original_offset_minutes'=>$tz_offset,'original_timezone'=>$tz_name,'status'=>'pending',
-                        'attempt_count'=>0,'processing'=>0,'created_at'=>gmdate('Y-m-d H:i:s')
-                    ];
-                    if($this->columnExists('scheduled_reels','media_type')) $ins['media_type']='story_video';
-                    if($this->columnExists('scheduled_reels','expires_at'))
-                        $ins['expires_at']=gmdate('Y-m-d H:i:s',strtotime($utc_sched)+self::STORY_EXPIRE_SECONDS);
-                    $this->db->insert('scheduled_reels',$ins);
-                    $responses[]=['type'=>'success','msg'=>"تمت جدولة Story Video على الصفحة $pid"];
-                } else {
-                    $immediateJobs[]=[
-                        'fb_page_id'=>$pid,'page_access_token'=>$page['page_access_token'],
-                        'tmp_name'=>$tmp,'file_size'=>filesize($tmp),'filename'=>$fname,
-                        'caption'=>$caption,'tz_offset'=>$tz_offset,'tz_name'=>$tz_name
-                    ];
-                }
+        foreach($fb_page_ids as $pid){
+            $page=$this->findPage($pages,$pid);
+            if(!$page || empty($page['page_access_token'])){
+                $responses[]=['type'=>'error','msg'=>"توكن مفقود للصفحة $pid"]; continue;
             }
-        }
-
-        if(!$immediateJobs) return $responses;
-
-        /* رفع فوري (مشابه للنسخة السابقة) */
-        $mh=curl_multi_init(); $handles=[];
-        foreach($immediateJobs as $k=>$job){
-            $url="https://graph.facebook.com/{$version}/{$job['fb_page_id']}/video_stories";
-            $payload=['upload_phase'=>'start','access_token'=>$job['page_access_token']];
-            $ch=curl_init($url);
-            curl_setopt_array($ch,[CURLOPT_POST=>1,CURLOPT_POSTFIELDS=>json_encode($payload),CURLOPT_HTTPHEADER=>['Content-Type: application/json'],CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false]);
-            $handles[$k]=['job'=>$job,'start_ch'=>$ch];
-            curl_multi_add_handle($mh,$ch);
-        }
-        $this->runMulti($mh);
-        foreach($handles as &$h){
-            $res=json_decode(curl_multi_getcontent($h['start_ch']),true);
-            $this->writeLog('stories_api.log','START page='.$h['job']['fb_page_id'].' res='.json_encode($res,JSON_UNESCAPED_UNICODE));
-            curl_multi_remove_handle($mh,$h['start_ch']); curl_close($h['start_ch']);
-            if(empty($res['video_id'])){
-                $h['error']=true;
-                $responses[]=['type'=>'error','msg'=>"فشل START (صفحة {$h['job']['fb_page_id']})"];
+            if($is_future){
+                $dir=FCPATH.'uploads/scheduled/';
+                if(!is_dir($dir)) @mkdir($dir,0775,true);
+                $safe=preg_replace('/[^a-zA-Z0-9_\-\.]/','_',$fname);
+                $stored='story_sched_'.time().'_'.$i.'_'.mt_rand(1000,9999).'_'.$safe;
+                if(!move_uploaded_file($tmp,$dir.$stored)){
+                    $responses[]=['type'=>'error','msg'=>"تعذر تخزين مجدول $fname"]; continue;
+                }
+                $orig_local = preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/',$local_sched)
+                    ? str_replace('T',' ',$local_sched).':00' : null;
+                $ins=[
+                    'user_id'=>$user_id,'fb_page_id'=>$pid,'video_path'=>'uploads/scheduled/'.$stored,
+                    'description'=>$caption,'scheduled_time'=>$utc_sched,'original_local_time'=>$orig_local,
+                    'original_offset_minutes'=>$tz_offset,'original_timezone'=>$tz_name,'status'=>'pending',
+                    'attempt_count'=>0,'processing'=>0,'created_at'=>gmdate('Y-m-d H:i:s')
+                ];
+                if($this->columnExists('scheduled_reels','media_type')) $ins['media_type']='story_video';
+                if($this->columnExists('scheduled_reels','expires_at'))
+                    $ins['expires_at']=gmdate('Y-m-d H:i:s',strtotime($utc_sched)+self::STORY_EXPIRE_SECONDS);
+                $this->db->insert('scheduled_reels',$ins);
+                $responses[]=['type'=>'success','msg'=>"تمت جدولة Story Video على الصفحة $pid"];
             } else {
-                $h['video_id']=$res['video_id'];
+                $immediateJobs[]=[
+                    'fb_page_id'=>$pid,'page_access_token'=>$page['page_access_token'],
+                    'tmp_name'=>$tmp,'file_size'=>filesize($tmp),'filename'=>$fname,
+                    'caption'=>$caption,'tz_offset'=>$tz_offset,'tz_name'=>$tz_name
+                ];
             }
-        } unset($h);
-
-        foreach($handles as &$h){
-            if(!empty($h['error'])) continue;
-            $url="https://rupload.facebook.com/video-upload/{$version}/{$h['video_id']}";
-            $ch=curl_init($url);
-            curl_setopt_array($ch,[CURLOPT_HTTPHEADER=>[
-                "Authorization: OAuth {$h['job']['page_access_token']}",
-                "offset: 0","file_size: {$h['job']['file_size']}"
-            ],CURLOPT_POST=>1,CURLOPT_POSTFIELDS=>file_get_contents($h['job']['tmp_name']),CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false]);
-            $h['upload_ch']=$ch;
-            curl_multi_add_handle($mh,$ch);
-        } unset($h);
-        $this->runMulti($mh);
-        foreach($handles as &$h){
-            if(!empty($h['error'])) continue;
-            $res=json_decode(curl_multi_getcontent($h['upload_ch']),true);
-            $this->writeLog('stories_api.log','UPLOAD page='.$h['job']['fb_page_id'].' res='.json_encode($res,JSON_UNESCAPED_UNICODE));
-            curl_multi_remove_handle($mh,$h['upload_ch']); curl_close($h['upload_ch']);
-            if(isset($res['error'])){
-                $h['error']=true;
-                $responses[]=['type'=>'error','msg'=>"فشل UPLOAD (صفحة {$h['job']['fb_page_id']})"];
-            }
-        } unset($h);
-
-        foreach($handles as &$h){
-            if(!empty($h['error'])) continue;
-            $url="https://graph.facebook.com/{$version}/{$h['job']['fb_page_id']}/video_stories";
-            $payload=['access_token'=>$h['job']['page_access_token'],'video_id'=>$h['video_id'],'upload_phase'=>'finish'];
-            $ch=curl_init($url);
-            curl_setopt_array($ch,[CURLOPT_POST=>1,CURLOPT_POSTFIELDS=>http_build_query($payload),CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false]);
-            $h['finish_ch']=$ch;
-            curl_multi_add_handle($mh,$ch);
-        } unset($h);
-        $this->runMulti($mh);
-        foreach($handles as &$h){
-            if(!empty($h['error'])) continue;
-            $res=json_decode(curl_multi_getcontent($h['finish_ch']),true);
-            $this->writeLog('stories_api.log','FINISH page='.$h['job']['fb_page_id'].' res='.json_encode($res,JSON_UNESCAPED_UNICODE));
-            curl_multi_remove_handle($mh,$h['finish_ch']); curl_close($h['finish_ch']);
-            if(isset($res['error'])){
-                $responses[]=['type'=>'error','msg'=>"فشل FINISH (صفحة {$h['job']['fb_page_id']})"];
-                continue;
-            }
-            $post_id=$res['post_id'] ?? null;
-            $ins=[
-                'user_id'=>$user_id,'fb_page_id'=>$h['job']['fb_page_id'],'video_id'=>$h['video_id'],
-                'file_name'=>$h['job']['filename'],'file_path'=>NULL,'cover_path'=>NULL,'cover_source'=>NULL,
-                'description'=>$h['job']['caption'],'scheduled_at'=>NULL,'original_local_time'=>NULL,
-                'original_offset_minutes'=>$h['job']['tz_offset'],'original_timezone'=>$h['job']['tz_name'],
-                'status'=>'published','created_at'=>gmdate('Y-m-d H:i:s')
-            ];
-            if($this->columnExists('reels','media_type')) $ins['media_type']='story_video';
-            if($this->columnExists('reels','post_id')) $ins['post_id']=$post_id;
-            if($this->columnExists('reels','expires_at')) $ins['expires_at']=gmdate('Y-m-d H:i:s',time()+self::STORY_EXPIRE_SECONDS);
-            $this->db->insert('reels',$ins);
-            $responses[]=['type'=>'success','msg'=>"تم نشر Story Video على الصفحة {$h['job']['fb_page_id']}"];
         }
-        unset($h);
-        curl_multi_close($mh);
-        return $responses;
     }
 
+    if(!$immediateJobs) return $responses;
+
+    // helper closures to reuse upload code
+    $upload_to_feed = function($job) use ($version, &$responses, $user_id) {
+        $page_id = $job['fb_page_id']; $token = $job['page_access_token']; $tmp = $job['tmp_name'];
+        $fname = $job['filename']; $caption = $job['caption'];
+        if(!is_file($tmp)){ $responses[]=['type'=>'error','msg'=>"ملف غير موجود: $fname (page $page_id)"]; return null; }
+        $mime = @mime_content_type($tmp) ?: 'video/mp4';
+        $url = "https://graph.facebook.com/{$version}/{$page_id}/videos";
+        $ch = curl_init($url);
+        $cfile = new CURLFile($tmp, $mime, $fname);
+        $payload = ['access_token'=>$token,'source'=>$cfile,'description'=>$caption,'published'=>'true'];
+        curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_RETURNTRANSFER=>true,CURLOPT_SSL_VERIFYPEER=>false,CURLOPT_TIMEOUT=>600]);
+        $res_raw = curl_exec($ch);
+        $err_no = curl_errno($ch); $err_msg = curl_error($ch); $info = curl_getinfo($ch)?:[]; curl_close($ch);
+        $this->writeLog('stories_api.log',"VIDEOS_UPLOAD page={$page_id} file={$fname} http_code=".($info['http_code']??'')." curl_errno={$err_no} curl_err={$err_msg} resp_preview=".substr($res_raw?:'null',0,2000));
+        if($err_no){ $responses[]=['type'=>'error','msg'=>"فشل رفع الفيديو (cURL) لصفحة {$page_id}: {$err_msg}"]; return null; }
+        $res = @json_decode($res_raw,true);
+        if(!is_array($res) || isset($res['error'])){ $errMsg = $res['error']['message'] ?? 'Unknown upload error'; $this->writeLog('stories_api.log',"VIDEOS_UPLOAD_ERROR page={$page_id} resp=".($res_raw?:'null')); $responses[]=['type'=>'error','msg'=>"فشل رفع الفيديو لصفحة {$page_id}: {$errMsg}"]; return null; }
+        return ['video_id'=>$res['id'] ?? $res['video_id'] ?? null,'raw'=>$res_raw];
+    };
+
+    // Story upload (START/UPLOAD/FINISH) as closure — يُعيد boolean نجاح
+    $upload_to_story = function($job) use ($version, &$responses, $user_id) {
+        // نستخدم نفس ثلاث مراحل START, UPLOAD (rupload) و FINISH كما كان سابقًا
+        $page_id = $job['fb_page_id']; $token = $job['page_access_token']; $tmp = $job['tmp_name']; $fname = $job['filename']; $caption = $job['caption'];
+        // START
+        $url = "https://graph.facebook.com/{$version}/{$page_id}/video_stories";
+        $payload = ['upload_phase'=>'start','access_token'=>$token];
+        $ch = curl_init($url);
+        curl_setopt_array($ch,[CURLOPT_POST=>1,CURLOPT_POSTFIELDS=>json_encode($payload),CURLOPT_HTTPHEADER=>['Content-Type: application/json'],CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false]);
+        $raw_start = curl_exec($ch); $err_no = curl_errno($ch); $err_msg = curl_error($ch); $info = curl_getinfo($ch)?:[]; curl_close($ch);
+        $this->writeLog('stories_api.log',"START page={$page_id} res=".substr($raw_start?:'null',0,2000)." http_code=".($info['http_code']??'')." curl_errno={$err_no}");
+        if($err_no) { $responses[]=['type'=>'error','msg'=>"فشل START لصفحة {$page_id}: {$err_msg}"]; return false; }
+        $res_start = @json_decode($raw_start,true);
+        if(empty($res_start['video_id'])){ $responses[]=['type'=>'error','msg'=>"فشل START (لا video_id) لصفحة {$page_id}"]; return false; }
+        $video_id = $res_start['video_id'];
+        $upload_url = $res_start['upload_url'] ?? ("https://rupload.facebook.com/video-upload/{$version}/{$video_id}");
+
+        // UPLOAD (بسيط: رفع الملف كاملاً)
+        $ch = curl_init($upload_url);
+        $file_content = @file_get_contents($tmp);
+        if($file_content === false){ $responses[]=['type'=>'error','msg'=>"فشل قراءة الملف لصفحة {$page_id}"]; return false; }
+        curl_setopt_array($ch,[CURLOPT_HTTPHEADER=>["Authorization: OAuth {$token}","offset: 0","file_size: ".strlen($file_content)],CURLOPT_POST=>1,CURLOPT_POSTFIELDS=>$file_content,CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false,CURLOPT_TIMEOUT=>600]);
+        $raw_up = curl_exec($ch); $err_no = curl_errno($ch); $err_msg = curl_error($ch); $info = curl_getinfo($ch)?:[]; curl_close($ch);
+        $this->writeLog('stories_api.log',"UPLOAD page={$page_id} res_preview=".substr($raw_up?:'null',0,2000)." http_code=".($info['http_code']??'')." curl_errno={$err_no}");
+        if($err_no){ $responses[]=['type'=>'error','msg'=>"فشل UPLOAD لصفحة {$page_id}: {$err_msg}"]; return false; }
+        $res_up = @json_decode($raw_up,true);
+        if(isset($res_up['error'])){ $responses[]=['type'=>'error','msg'=>"فشل UPLOAD (FB) لصفحة {$page_id}"]; return false; }
+
+        // FINISH
+        $url_finish = "https://graph.facebook.com/{$version}/{$page_id}/video_stories";
+        $payload = ['access_token'=>$token,'video_id'=>$video_id,'upload_phase'=>'finish','description'=>$caption];
+        $ch = curl_init($url_finish);
+        curl_setopt_array($ch,[CURLOPT_POST=>1,CURLOPT_POSTFIELDS=>http_build_query($payload),CURLOPT_RETURNTRANSFER=>1,CURLOPT_SSL_VERIFYPEER=>false,CURLOPT_TIMEOUT=>60]);
+        $raw_finish = curl_exec($ch); $err_no = curl_errno($ch); $err_msg = curl_error($ch); $info = curl_getinfo($ch)?:[]; curl_close($ch);
+        $this->writeLog('stories_api.log',"FINISH page={$page_id} res_preview=".substr($raw_finish?:'null',0,2000)." http_code=".($info['http_code']??'')." curl_errno={$err_no}");
+        if($err_no){ $responses[]=['type'=>'error','msg'=>"فشل FINISH لصفحة {$page_id}: {$err_msg}"]; return false; }
+        $res_fin = @json_decode($raw_finish,true);
+        if(!is_array($res_fin) || isset($res_fin['error'])){ $responses[]=['type'=>'error','msg'=>"فشل FINISH (FB) لصفحة {$page_id}"]; return false; }
+
+        // تخزين في DB
+        $publishId = $res_fin['post_id'] ?? $res_fin['id'] ?? $res_fin['video_id'] ?? $video_id;
+        $ins=[
+            'user_id'=>$user_id,'fb_page_id'=>$page_id,'video_id'=>$video_id,
+            'file_name'=>$fname,'file_path'=>NULL,'cover_path'=>NULL,'cover_source'=>NULL,
+            'description'=>$caption,'scheduled_at'=>NULL,'original_local_time'=>NULL,
+            'original_offset_minutes'=>$job['tz_offset'] ?? 0,'original_timezone'=>$job['tz_name'] ?? '',
+            'status'=>'published','created_at'=>gmdate('Y-m-d H:i:s')
+        ];
+        if($this->columnExists('reels','media_type')) $ins['media_type']='story_video';
+        if($this->columnExists('reels','post_id')) $ins['post_id']=$publishId;
+        if($this->columnExists('reels','expires_at')) $ins['expires_at']=gmdate('Y-m-d H:i:s',time()+self::STORY_EXPIRE_SECONDS);
+        $this->db->insert('reels',$ins);
+        $responses[]=['type'=>'success','msg'=>"تم نشر Story Video على الصفحة {$page_id}"];
+        return true;
+    };
+
+    // الآن نمر على immediateJobs ونطبق ما يطلبه publish_as
+    foreach($immediateJobs as $job){
+        // إذا المستخدم طلب both نرفع للـfeed أولاً ثم نحمّل نسخة كـstory
+        if($publish_as === 'feed'){
+            $res = $upload_to_feed($job);
+            if($res && $res['video_id']){
+                // حفظ في DB
+                $video_id = $res['video_id'];
+                $permalink = null;
+                // محاولة جلب permalink سريعاً
+                if(method_exists($this,'facebook_api_call')){
+                    $check = $this->facebook_api_call("https://graph.facebook.com/{$version}/{$video_id}?fields=permalink_url&access_token=".urlencode($job['page_access_token']));
+                    if(is_array($check) && !empty($check['permalink_url'])) $permalink = $check['permalink_url'];
+                }
+                $status_to_store = $permalink ? 'published' : 'processing';
+                $ins=[ 'user_id'=>$user_id,'fb_page_id'=>$job['fb_page_id'],'video_id'=>$video_id,'file_name'=>mb_substr($job['filename'],0,191),'description'=>mb_substr($job['caption'],0,1000),'status'=>$status_to_store,'created_at'=>gmdate('Y-m-d H:i:s') ];
+                if($this->columnExists('reels','media_type')) $ins['media_type']='video';
+                if($this->columnExists('reels','post_id') && $permalink) $ins['post_id']=$permalink;
+                if($this->columnExists('reels','fb_response')) $ins['fb_response']=substr($res['raw']??'',0,2000);
+                $this->db->insert('reels',$ins);
+                $responses[]=['type'=>'success','msg'=>"تم نشر الفيديو على الصفحة {$job['fb_page_id']}"];
+            }
+        } elseif($publish_as === 'reel'){
+            // محاولة رفع إلى /{page_id}/reels (إن وُجد) وإلا fallback إلى /videos
+            $page_id = $job['fb_page_id']; $token = $job['page_access_token']; $tmp = $job['tmp_name']; $fname = $job['filename']; $caption = $job['caption'];
+            // حاول endpoint /reels أولاً
+            $reel_url = "https://graph.facebook.com/{$version}/{$page_id}/reels";
+            $ch = curl_init($reel_url);
+            $mime = @mime_content_type($tmp) ?: 'video/mp4';
+            $cfile = new CURLFile($tmp,$mime,$fname);
+            $payload = ['access_token'=>$token,'source'=>$cfile,'description'=>$caption,'published'=>'true'];
+            curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_RETURNTRANSFER=>true,CURLOPT_SSL_VERIFYPEER=>false,CURLOPT_TIMEOUT=>600]);
+            $raw = curl_exec($ch); $err_no = curl_errno($ch); $err_msg = curl_error($ch); $info = curl_getinfo($ch)?:[]; curl_close($ch);
+            $this->writeLog('stories_api.log',"REELS_UPLOAD_TRY page={$page_id} http_code=".($info['http_code']??'')." curl_errno={$err_no} resp_preview=".substr($raw?:'null',0,2000));
+            $success=false; $res = @json_decode($raw,true);
+            if(is_array($res) && !isset($res['error']) && !empty($res['id'])){
+                $success = true; $video_id = $res['id']; $raw_resp = $raw;
+            } else {
+                // fallback إلى /videos
+                $fres = $upload_to_feed($job);
+                if($fres && $fres['video_id']){ $success=true; $video_id = $fres['video_id']; $raw_resp = $fres['raw']; }
+            }
+            if($success){
+                $permalink = null;
+                if(method_exists($this,'facebook_api_call')){
+                    $check = $this->facebook_api_call("https://graph.facebook.com/{$version}/{$video_id}?fields=permalink_url&access_token=".urlencode($job['page_access_token']));
+                    if(is_array($check) && !empty($check['permalink_url'])) $permalink = $check['permalink_url'];
+                }
+                $status_to_store = $permalink ? 'published' : 'processing';
+                $ins=[ 'user_id'=>$user_id,'fb_page_id'=>$job['fb_page_id'],'video_id'=>$video_id,'file_name'=>mb_substr($job['filename'],0,191),'description'=>mb_substr($job['caption'],0,1000),'status'=>$status_to_store,'created_at'=>gmdate('Y-m-d H:i:s') ];
+                if($this->columnExists('reels','media_type')) $ins['media_type']='reel';
+                if($this->columnExists('reels','post_id') && $permalink) $ins['post_id']=$permalink;
+                if($this->columnExists('reels','fb_response')) $ins['fb_response']=substr($raw_resp??'',0,2000);
+                $this->db->insert('reels',$ins);
+                $responses[]=['type'=>'success','msg'=>"تم نشر Reel (أو فيديو) على الصفحة {$job['fb_page_id']}"];
+            }
+        } elseif($publish_as === 'both'){
+            // أولاً feed
+            $fres = $upload_to_feed($job);
+            if($fres && $fres['video_id']){
+                // ادخل السجل للـfeed
+                $video_id = $fres['video_id']; $raw_resp = $fres['raw'];
+                $permalink = null;
+                if(method_exists($this,'facebook_api_call')){
+                    $check = $this->facebook_api_call("https://graph.facebook.com/{$version}/{$video_id}?fields=permalink_url&access_token=".urlencode($job['page_access_token']));
+                    if(is_array($check) && !empty($check['permalink_url'])) $permalink = $check['permalink_url'];
+                }
+                $status_to_store = $permalink ? 'published' : 'processing';
+                $ins=[ 'user_id'=>$user_id,'fb_page_id'=>$job['fb_page_id'],'video_id'=>$video_id,'file_name'=>mb_substr($job['filename'],0,191),'description'=>mb_substr($job['caption'],0,1000),'status'=>$status_to_store,'created_at'=>gmdate('Y-m-d H:i:s') ];
+                if($this->columnExists('reels','media_type')) $ins['media_type']='video';
+                if($this->columnExists('reels','post_id') && $permalink) $ins['post_id']=$permalink;
+                if($this->columnExists('reels','fb_response')) $ins['fb_response']=substr($raw_resp??'',0,2000);
+                $this->db->insert('reels',$ins);
+            }
+            // ثم حاول رفع كـStory (نسخة منفصلة)
+            $upload_to_story($job);
+        } else {
+            // افتراضي: 'story'
+            $upload_to_story($job);
+        }
+    }
+
+    return $responses;
+}
+private function facebook_api_call($url, $method = 'GET', $payload = null, $timeout = 10)
+{
+    // بناء URL للـ GET إن أعطينا payload كمصفوفة
+    if ($method === 'GET' && is_array($payload) && !empty($payload)) {
+        $url .= (strpos($url, '?') === false ? '?' : '&') . http_build_query($payload);
+    }
+
+    $ch = curl_init();
+    $opts = [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_TIMEOUT => $timeout,
+    ];
+
+    if ($method === 'POST') {
+        $opts[CURLOPT_POST] = true;
+        // إذا payload مصفوفة نرسلها بصيغة form-urlencoded
+        $opts[CURLOPT_POSTFIELDS] = is_array($payload) ? http_build_query($payload) : $payload;
+    }
+
+    curl_setopt_array($ch, $opts);
+    $raw = @curl_exec($ch);
+    $info = curl_getinfo($ch) ?: [];
+    $err_no = curl_errno($ch);
+    $err_msg = curl_error($ch);
+    curl_close($ch);
+
+    // لوق تفصيلي لمساعدة التشخيص
+    $this->writeLog('stories_api.log', "FB_API_CALL url={$url} method={$method} http_code=" . ($info['http_code'] ?? '') . " curl_errno={$err_no} curl_error={$err_msg} resp_preview=" . substr($raw ?: 'null', 0, 2000));
+
+    if ($err_no) {
+        return null;
+    }
+
+    $json = @json_decode($raw, true);
+    return is_array($json) ? $json : null;
+}
     /* نشر Story Video مجدول */
     public function publish_scheduled_story_video($row)
     {
@@ -1322,8 +1495,13 @@ public function upload_story_photo($user_id,$pagesTokens,$post,$files)
         $fRes=$this->curlForm($fin,['access_token'=>$page['page_access_token'],'video_id'=>$video_id,'upload_phase'=>'finish']);
         $fJson=json_decode($fRes,true);
         $this->writeLog('stories_api.log','SCHED_FINISH id='.$row['id'].' res='.json_encode($fJson,JSON_UNESCAPED_UNICODE));
-        if(isset($fJson['error'])){ $this->failScheduled($row,$attempt,'فشل FINISH'); return; }
-        $post_id=$fJson['post_id'] ?? null;
+        if(!is_array($fJson) || isset($fJson['error'])){
+            $this->failScheduled($row,$attempt,'فشل FINISH'); return;
+        }
+
+        $publishId = $fJson['post_id'] ?? $fJson['id'] ?? $video_id ?? null;
+        if (!$publishId) { $this->failScheduled($row,$attempt,'فشل FINISH / no publish id'); return; }
+        $post_id = $publishId;
 
         $this->db->where('id',$row['id'])->update('scheduled_reels',[
             'status'=>'uploaded','fb_response'=>$video_id,'published_time'=>gmdate('Y-m-d H:i:s'),
