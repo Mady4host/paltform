@@ -119,18 +119,15 @@ private function normalizeLocalSchedule(?string $s): ?string
 
     private function resolveLockPath(string $name): string
     {
-        // الأفضل: داخل المشروع لضمان صلاحيات الكتابة عبر CLI
         $dir = FCPATH.'application/cache/locks/';
         if (!is_dir($dir)) @mkdir($dir, 0775, true);
         if (is_dir($dir) && is_writable($dir)) {
             return $dir.$name;
         }
-        // بديل: مجلد النظام المؤقت
         $tmp = @sys_get_temp_dir();
         if ($tmp && is_dir($tmp) && is_writable($tmp)) {
             return rtrim($tmp,'/').'/'.$name;
         }
-        // آخر حل: جذر المشروع
         return FCPATH.$name;
     }
 
@@ -141,7 +138,6 @@ private function normalizeLocalSchedule(?string $s): ?string
 
         $fh = @fopen($lock, 'c+');
         if (!$fh) {
-            // لا نفشل التنفيذ – نكمل بدون قفل، مع تسجيل
             $this->dbg('cron_lock_open_fail', $lock);
             $fn();
             return;
@@ -166,7 +162,6 @@ private function normalizeLocalSchedule(?string $s): ?string
         $this->require_login();
         $uid=(int)$this->session->userdata('user_id');
 
-        // نستخدم pagesModel للعرض فقط (صور/أسماء)
         $pages=$this->pagesModel->get_pages_by_user($uid);
         if(!$pages){
             $this->session->set_flashdata('msg','لا يوجد صفحات، قم بالربط أولاً.');
@@ -183,7 +178,6 @@ private function normalizeLocalSchedule(?string $s): ?string
             }
         }
 
-        // NEW: التقاط الصفحات المراد تمييزها مسبقاً من ?page=1,2,3
         $preParam = trim((string)$this->input->get('page', true));
         $preselected_pages = [];
         if($preParam !== ''){
@@ -208,7 +202,6 @@ public function process_upload()
     $this->require_login();
     $uid = (int)$this->session->userdata('user_id');
 
-    // Helper داخلي سريع للّوج في stories_api.log
     $stories_log = function(string $label, array $ctx = []) {
         $dir = FCPATH.'application/logs/';
         if (!is_dir($dir)) @mkdir($dir, 0775, true);
@@ -217,7 +210,6 @@ public function process_upload()
         @file_put_contents($dir.'stories_api.log', $line.PHP_EOL, FILE_APPEND);
     };
 
-    // لوج لقيم ini الحالية (قيم الويب الفعلية)
     $stories_log('CTRL_ENTER', [
         'ini' => [
             'upload_max_filesize' => ini_get('upload_max_filesize'),
@@ -228,14 +220,12 @@ public function process_upload()
         'post_media_type' => $this->input->post('media_type', true),
     ]);
 
-    // للعرض
     $pages = $this->pagesModel->get_pages_by_user($uid);
     if (!$pages) {
         $stories_log('CTRL_NO_PAGES', []);
         $this->session->set_flashdata('msg','لا يوجد صفحات.');
         redirect('reels/upload'); return;
     }
-    // للمصادقة/التوكن: نقرأ من جدول المنصة
     $pagesTokens = $this->Reel_model->get_user_pages($uid);
 
     $media_type  = $this->input->post('media_type') ?: 'reel';
@@ -247,7 +237,6 @@ public function process_upload()
         redirect('reels/upload'); return;
     }
 
-    // هيلبر للحصول على توكن الصفحة بغض النظر عن شكل $pagesTokens
     $findPageToken = function($pagesTokens, string $pid) {
         if (is_array($pagesTokens)) {
             if (isset($pagesTokens[$pid]) && is_array($pagesTokens[$pid])) {
@@ -265,7 +254,6 @@ public function process_upload()
         return null;
     };
 
-    // فلترة الصفحات حسب وجود التوكن
     $valid_pages = [];
     $missing_token = [];
     foreach ((array)$fb_page_ids as $pid) {
@@ -315,7 +303,6 @@ public function process_upload()
             redirect('reels/upload'); return;
         }
 
-        // مصفوفات موحّدة للملفات
         $names = $isArray ? (array)$sf['name']     : [$sf['name']];
         $types = $isArray ? (array)$sf['type']     : [$sf['type']];
         $tmps  = $isArray ? (array)$sf['tmp_name'] : [$sf['tmp_name']];
@@ -323,11 +310,9 @@ public function process_upload()
         $sizes = $isArray ? (array)$sf['size']     : [$sf['size']];
         $count = count($names);
 
-        // إعدادات المنطقة الزمنية
         $tz_offset = (int)($this->input->post('tz_offset_minutes') ?? 0);
         $tz_name   = trim((string)$this->input->post('tz_name'));
 
-        // جهّز مصادر محتملة للجدولة (مصفوفية ومفردة)
         $candidateArrays = [];
         $preferKeys = [
             'story_schedule_locals','story_schedule_times',
@@ -339,7 +324,6 @@ public function process_upload()
             $v = $_POST[$k] ?? null;
             if (is_array($v)) $candidateArrays[$k] = $v;
         }
-        // مسح ديناميكي لأي مصفوفة قد تحمل أوقات للستوري/الصورة
         foreach ($_POST as $k=>$v) {
             if (!is_array($v)) continue;
             $kn = strtolower((string)$k);
@@ -348,7 +332,6 @@ public function process_upload()
             }
         }
 
-        // حقول مفردة fallback لأول عنصر فقط
         $singleCandidates = [
             'story_schedule_local','story_schedule_time','story_scheduled_time',
             'schedule_time','scheduled_time','scheduled_local','schedule_local'
@@ -370,7 +353,6 @@ public function process_upload()
         $errorMsgs   = [];
 
         for ($i=0; $i<$count; $i++) {
-            // عنصر واحد
             $fileOne = [
                 'name'     => $names[$i] ?? '',
                 'type'     => $types[$i] ?? '',
@@ -396,7 +378,6 @@ public function process_upload()
                 continue;
             }
 
-            // الوصف + الهاشتاجات
             $desc = trim(xss_clean((string)$this->input->post('description')));
             if ($desc==='') {
                 $base = pathinfo($fileOne['name'], PATHINFO_FILENAME);
@@ -410,14 +391,12 @@ public function process_upload()
                 }
             }
 
-            // استخرج وقت العنصر i من أي مصدر مرشّح
             $rawLocal = '';
             foreach ($candidateArrays as $k=>$arr) {
                 if (isset($arr[$i]) && trim((string)$arr[$i])!=='') {
                     $rawLocal = trim((string)$arr[$i]); break;
                 }
             }
-            // fallback مفرد لأول عنصر فقط
             if ($rawLocal === '' && $i === 0) {
                 foreach ($singleValues as $v) {
                     if (trim($v)!==''){ $rawLocal = trim($v); break; }
@@ -438,7 +417,6 @@ public function process_upload()
             ]);
 
             if ($parsedUtc && $isFuture) {
-                // جدولة هذا العنصر
                 $absDir = FCPATH.self::SCHEDULE_DIR;
                 if (!is_dir($absDir)) @mkdir($absDir,0775,true);
 
@@ -483,7 +461,6 @@ public function process_upload()
                 ]);
                 $successMsgs[] = 'تمت جدولة ستوري الصورة (عنصر #'.($i+1).') لعدد '.count($valid_pages).' صفحة.';
             } else {
-                // نشر فوري لهذا العنصر
                 $_POST['fb_page_ids'] = $valid_pages;
                 $filesNormalized = ['story_photo_file' => $fileOne];
                 $responses = $this->Reel_model->upload_story_photo($uid, $pagesTokens, $_POST, $filesNormalized);
@@ -538,7 +515,6 @@ public function process_upload()
 
             $_POST['fb_page_ids'] = $valid_pages;
 
-            // مرر صفحات التوكن من جدول المنصة
             $responses = $this->Reel_model->upload_story_video($uid, $pagesTokens, $_POST, $_FILES);
             $success=[]; $error=[];
             foreach ($responses as $r) { if (($r['type'] ?? '')==='success') $success[]=$r['msg'] ?? ''; else $error[]=$r['msg'] ?? ''; }
@@ -672,7 +648,6 @@ private function scheduleBatch(
     $selected_tags = trim((string)$this->input->post('selected_hashtags'));
     $rows=[]; $now=gmdate('Y-m-d H:i:s'); $saved=0; $mapIdxToPages=[];
 
-    // هل جدول scheduled_reels فيه عمود media_type؟
     $hasMediaType = $this->db->field_exists('media_type','scheduled_reels');
 
     foreach($file_indices as $i){
@@ -720,12 +695,11 @@ private function scheduleBatch(
                 'original_local_time'      => $original_local_time,
                 'original_offset_minutes'  => $tz_offset,
                 'original_timezone'        => $tz_name,
-                'status'                   => 'pending',  // رجّعناها زي الأول
+                'status'                   => 'pending',
                 'attempt_count'            => 0,
                 'processing'               => 0,
                 'created_at'               => $now
             ];
-            // فقط لو العمود موجود
             if ($hasMediaType) $row['media_type'] = 'reel';
 
             $rows[] = $row;
@@ -737,7 +711,6 @@ private function scheduleBatch(
 
     $this->db->insert_batch('scheduled_reels',$rows);
 
-    // تحديث إحصائيات الصفحات — فقط إذا كان جدول facebook_pages موجود والأعمدة موجودة
     if ($this->db->table_exists('facebook_pages')) {
         $hasLastScheduled = $this->db->field_exists('last_scheduled_at','facebook_pages');
         $hasSchedCount    = $this->db->field_exists('scheduled_count','facebook_pages');
@@ -913,72 +886,68 @@ private function scheduleBatch(
     /* ======================== Cron Jobs ======================== */
 
     public function cron_publish($token=null)
-{
-    if(!$this->input->is_cli_request()){
-        if($token!==self::CRON_TOKEN){ show_error('Unauthorized',403); return; }
-    }
-
-    // لوج سريع في stories_api.log
-    $stories_log = function(string $label, array $ctx = []) {
-        $dir = FCPATH.'application/logs/';
-        if (!is_dir($dir)) @mkdir($dir, 0775, true);
-        $line = '['.gmdate('Y-m-d H:i:s')."] $label";
-        if (!empty($ctx)) $line .= ' '.json_encode($ctx, JSON_UNESCAPED_UNICODE);
-        @file_put_contents($dir.'stories_api.log', $line.PHP_EOL, FILE_APPEND);
-    };
-
-    $this->withLock('reels_cron.lock', function () use ($stories_log) {
-        $now = gmdate('Y-m-d H:i:s');
-        $due = $this->Reel_model->get_due_scheduled_reels(40);
-        $stories_log('CRON_RUN', ['now'=>$now, 'due_count'=>count($due)]);
-
-        foreach($due as $r){
-            $id = (int)($r['id'] ?? 0);
-            $mt = (string)($r['media_type'] ?? '');
-            $vp = (string)($r['video_path'] ?? '');
-            $pid = (string)($r['fb_page_id'] ?? '');
-
-            $stories_log('CRON_PICK', [
-                'id'=>$id,'media_type'=>$mt,'page'=>$pid,'path'=>$vp,'scheduled_time'=>($r['scheduled_time'] ?? null)
-            ]);
-
-            // اكتشف نوع الصورة تلقائياً لو media_type غير مذكور
-            $ext = strtolower(pathinfo($vp, PATHINFO_EXTENSION));
-            $isImage = in_array($ext, ['jpg','jpeg','png','webp','gif'], true);
-
-            try {
-                if (self::FEATURE_STORIES) {
-                    if ($mt === 'story_photo' || ($mt === '' && $isImage)) {
-                        if (method_exists($this->Reel_model,'publish_scheduled_story_photo')) {
-                            $this->Reel_model->publish_scheduled_story_photo($r);
-                            continue;
-                        } else {
-                            $stories_log('CRON_WARN', ['id'=>$id,'msg'=>'publish_scheduled_story_photo missing']);
-                        }
-                    }
-                    if ($mt === 'story_video') {
-                        if (method_exists($this->Reel_model,'publish_scheduled_story_video')) {
-                            $this->Reel_model->publish_scheduled_story_video($r);
-                            continue;
-                        } else {
-                            $stories_log('CRON_WARN', ['id'=>$id,'msg'=>'publish_scheduled_story_video missing']);
-                        }
-                    }
-                }
-
-                // الافتراضي: ريلز فيديو
-                $this->Reel_model->process_scheduled_reel($r);
-
-            } catch (Throwable $e) {
-                $stories_log('CRON_EXCEPTION', ['id'=>$id,'msg'=>$e->getMessage(),'file'=>$e->getFile(),'line'=>$e->getLine()]);
-                // اترك الموديل يعالج حالات الفشل الداخلية لو بيعمل كده، وإلا اعمل update هنا
-            }
+    {
+        if(!$this->input->is_cli_request()){
+            if($token!==self::CRON_TOKEN){ show_error('Unauthorized',403); return; }
         }
 
-        $stories_log('CRON_DONE', []);
-        echo "Processed ".count($due)." scheduled items.\n";
-    });
-}
+        $stories_log = function(string $label, array $ctx = []) {
+            $dir = FCPATH.'application/logs/';
+            if (!is_dir($dir)) @mkdir($dir, 0775, true);
+            $line = '['.gmdate('Y-m-d H:i:s')."] $label";
+            if (!empty($ctx)) $line .= ' '.json_encode($ctx, JSON_UNESCAPED_UNICODE);
+            @file_put_contents($dir.'stories_api.log', $line.PHP_EOL, FILE_APPEND);
+        };
+
+        $this->withLock('reels_cron.lock', function () use ($stories_log) {
+            $now = gmdate('Y-m-d H:i:s');
+            $due = $this->Reel_model->get_due_scheduled_reels(40);
+            $stories_log('CRON_RUN', ['now'=>$now, 'due_count'=>count($due)]);
+
+            foreach($due as $r){
+                $id = (int)($r['id'] ?? 0);
+                $mt = (string)($r['media_type'] ?? '');
+                $vp = (string)($r['video_path'] ?? '');
+                $pid = (string)($r['fb_page_id'] ?? '');
+
+                $stories_log('CRON_PICK', [
+                    'id'=>$id,'media_type'=>$mt,'page'=>$pid,'path'=>$vp,'scheduled_time'=>($r['scheduled_time'] ?? null)
+                ]);
+
+                $ext = strtolower(pathinfo($vp, PATHINFO_EXTENSION));
+                $isImage = in_array($ext, ['jpg','jpeg','png','webp','gif'], true);
+
+                try {
+                    if (self::FEATURE_STORIES) {
+                        if ($mt === 'story_photo' || ($mt === '' && $isImage)) {
+                            if (method_exists($this->Reel_model,'publish_scheduled_story_photo')) {
+                                $this->Reel_model->publish_scheduled_story_photo($r);
+                                continue;
+                            } else {
+                                $stories_log('CRON_WARN', ['id'=>$id,'msg'=>'publish_scheduled_story_photo missing']);
+                            }
+                        }
+                        if ($mt === 'story_video') {
+                            if (method_exists($this->Reel_model,'publish_scheduled_story_video')) {
+                                $this->Reel_model->publish_scheduled_story_video($r);
+                                continue;
+                            } else {
+                                $stories_log('CRON_WARN', ['id'=>$id,'msg'=>'publish_scheduled_story_video missing']);
+                            }
+                        }
+                    }
+
+                    $this->Reel_model->process_scheduled_reel($r);
+
+                } catch (Throwable $e) {
+                    $stories_log('CRON_EXCEPTION', ['id'=>$id,'msg'=>$e->getMessage(),'file'=>$e->getFile(),'line'=>$e->getLine()]);
+                }
+            }
+
+            $stories_log('CRON_DONE', []);
+            echo "Processed ".count($due)." scheduled items.\n";
+        });
+    }
     public function cron_comments($token=null)
     {
         if(!$this->input->is_cli_request()){
